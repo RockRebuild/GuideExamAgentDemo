@@ -1,0 +1,23 @@
+# 虚拟环境
+venv/
+.venv/
+
+# 向量数据库持久化数据
+chroma_db/
+
+# mypy 缓存
+.mypy_cache/
+
+# Python 字节码
+__pycache__/
+*.pyc
+*.pyo
+
+# 环境变量（含敏感信息）
+.env
+
+# IDE 配置（可选，如果不想提交个人 IDE 设置）
+.idea/
+.vscode/
+*.swp
+*.swo
