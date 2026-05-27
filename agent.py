@@ -11,12 +11,6 @@ memory = MemorySaver()
 
 
 
-# 1. 创建 LLM（大脑）
-# llm = ChatDeepSeek(
-#     model="deepseek-chat",
-#     api_key="sk-0a7f49ba2a8f41698e9b1b21b8ecd4ac",
-#     temperature=0.3
-# )
 
 llm = ChatOpenAI(
     model="deepseek-chat",

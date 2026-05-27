@@ -117,23 +117,6 @@ def search_textbook(query: str) -> str:
     return "\n\n".join(results)
 
 
-@tool
-def grade_answer(question_id: str, student_answer: str) -> str:
-    """根据题库标准答案批改学员答案，返回对错及解析。"""
-    with open("question_bank.json", "r", encoding="utf-8") as f:
-        questions = json.load(f)
-
-    question = next((q for q in questions if q["id"] == question_id), None)
-    if not question:
-        return f"未找到ID为 {question_id} 的题目。"
-
-    correct = question["answer"].strip().upper()
-    student = student_answer.strip().upper()
-
-    if correct == student:
-        return f"✅ 回答正确！\n解析：{question.get('explanation', '暂无解析')}"
-    else:
-        return f"❌ 回答错误。你的答案：{student}，正确答案：{correct}。\n解析：{question.get('explanation', '暂无解析')}"
 
 def detect_chapter(text: str) -> str:
     """从文本中检测章节标题"""
@@ -146,3 +129,48 @@ def detect_chapter(text: str) -> str:
     if match:
         return match.group().strip()
     return "未知章节"
+
+
+@tool
+def grade_answer(question_id: str, student_answer: str) -> str:
+    """
+    根据题库标准答案批改学员的答案，返回对错、解析，并推荐相关知识点。
+    当用户要求批改题目、对答案、判分时，**必须**调用本工具。
+    参数：
+        question_id: 题目的唯一ID（如 q_001）
+        student_answer: 学员的答案（如 A、B、C、D，或判断题的“对/错”）
+    """
+    import json
+    try:
+        with open("question_bank.json", "r", encoding="utf-8") as f:
+            questions = json.load(f)
+    except FileNotFoundError:
+        return "题库文件未找到，请联系管理员。"
+
+    # 查找题目
+    question = next((q for q in questions if q["id"] == question_id), None)
+    if not question:
+        return f"未找到ID为 {question_id} 的题目，请检查题目ID是否正确。"
+
+    correct = question["answer"].strip().upper()
+    student = student_answer.strip().upper()
+
+    # 批改结果
+    if correct == student:
+        result = (
+            f"✅ **回答正确！**\n"
+            f"题目：{question['question']}\n"
+            f"你的答案：{student}\n"
+            f"解析：{question.get('explanation', '暂无解析')}"
+        )
+    else:
+        result = (
+            f"❌ **回答错误。**\n"
+            f"题目：{question['question']}\n"
+            f"你的答案：{student}\n"
+            f"正确答案：{correct}\n"
+            f"解析：{question.get('explanation', '暂无解析')}\n"
+            f"💡 建议：你可以让我帮你查找「{question['chapter']}」的相关知识点来巩固学习。"
+        )
+
+    return result
