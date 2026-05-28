@@ -1,6 +1,11 @@
 import json
 import os
 import re
+# from rank_bm25 import BM25Okapi
+# import jieba
+# from langchain.retrievers import ContextualCompressionRetriever
+# from langchain.retrievers.document_compressors import CrossEncoderReranker
+# from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 
 from langchain_community.embeddings import DashScopeEmbeddings
 
@@ -19,6 +24,7 @@ from langchain_community.document_loaders import PyPDFLoader
 
 print("当前工作目录:", os.getcwd())
 print("预期文件完整路径:", os.path.join(os.getcwd(), "question_bank.json"))
+
 
 @tool
 def search_questions(chapter: str, qtype: Optional[str] = "全部", count: int = 5) -> str:
@@ -71,9 +77,8 @@ def load_vectorstore():
 def initialize_vectorstore():
     # 如果没有数据，可以初始化加载
     """加载或创建 Chroma 向量库"""
-    vectorstore = load_vectorstore()
     print("step 3")
-
+    vectorstore = load_vectorstore()
     if vectorstore._collection.count() == 0:  # 最终还是得用这个
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         print("step 4")
@@ -174,3 +179,57 @@ def grade_answer(question_id: str, student_answer: str) -> str:
         )
 
     return result
+
+# # 初始化 BM25（在启动时做一次）
+# def build_bm25_index(chunks):
+#     """建立关键词索引"""
+#     tokenized_corpus = [list(jieba.cut(chunk)) for chunk in chunks]
+#     return BM25Okapi(tokenized_corpus)
+#
+# # 假设你有 chunks 列表（教材所有片段）
+# bm25 = build_bm25_index(chunks)
+#
+# @tool
+# def hybrid_search(query: str, k: int = 5) -> str:
+#     """混合检索教材内容：结合语义和关键词。"""
+#     # 1. 语义检索（你已有的向量检索）
+#     semantic_docs = vectorstore.similarity_search(query, k=k)
+#
+#     # 2. 关键词检索（BM25）
+#     tokenized_query = list(jieba.cut(query))
+#     keyword_scores = bm25.get_scores(tokenized_query)
+#     top_kw_indices = sorted(range(len(keyword_scores)), key=lambda i: keyword_scores[i], reverse=True)[:k]
+#     keyword_docs = [chunks[i] for i in top_kw_indices]
+#
+#     # 3. 结果融合（简单合并，实际可用 RRF 算法）
+#     all_docs = semantic_docs + keyword_docs
+#     # 去重（按文本相似度）
+#     unique_docs = deduplicate_docs(all_docs)
+#     # 限制最终返回数量
+#     unique_docs = unique_docs[:k]
+#
+#     if not unique_docs:
+#         return "未找到相关内容。"
+#     return "\n\n".join([d.page_content for d in unique_docs])
+#
+# # 1. 加载 Reranker 模型（中文优化版）
+# model = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-large")
+# compressor = CrossEncoderReranker(model=model, top_n=3)
+#
+# # 2. 把 Chroma 包装成 Retriever
+# retriever = vectorstore.as_retriever(search_kwargs={"k": 10})  # 先召回10个
+#
+# # 3. 创建压缩检索器（Reranker 二次筛选）
+# compression_retriever = ContextualCompressionRetriever(
+#     base_compressor=compressor,
+#     base_retriever=retriever
+# )
+#
+# # 4. 在工具中使用
+# @tool
+# def search_with_rerank(query: str) -> str:
+#     """检索教材并重排序，确保最相关的结果排在前面。"""
+#     docs = compression_retriever.get_relevant_documents(query)
+#     if not docs:
+#         return "未找到相关内容。"
+#     return "\n\n".join([doc.page_content for doc in docs])
