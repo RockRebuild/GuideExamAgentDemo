@@ -49,12 +49,6 @@ def search_questions(chapter: str, qtype: Optional[str] = "全部", count: int =
         result.append(f"ID:{q['id']} [{q['type']}] {q['question']}\n选项：{' / '.join(q['options'])}")
     return "\n\n".join(result)
 
-# 创建或加载向量库（只需执行一次）
-# 设置你的 DeepSeek API Key（推荐用环境变量，别硬编码）
-os.environ["DEEPSEEK_API_KEY"] = "sk-"
-os.environ["DASHSCOPE_API_KEY"] = "sk-"
-
-
 def load_embedding_model():
     """加载并缓存 BGE 嵌入模型"""
     print("step 1")

@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  agent:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./chroma_db:/app/chroma_db
