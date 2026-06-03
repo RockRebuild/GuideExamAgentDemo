@@ -1,15 +1,18 @@
 import os
 
+import redis
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.redis import RedisSaver
 from langgraph.prebuilt import create_react_agent
 from tools import search_questions, search_textbook, grade_answer  # 导入你的工具
 from langgraph.checkpoint.memory import MemorySaver
+from dotenv import load_dotenv
 
-memory = MemorySaver()
-
-
+load_dotenv()  # 自动查找并加载项目根目录下的 .env 文件
+memory = RedisSaver(redis_url="redis://localhost:6379")
+memory.setup()
 
 
 llm = ChatOpenAI(
@@ -39,5 +42,5 @@ prompt_template = ChatPromptTemplate.from_messages([
     ("placeholder", "{messages}"),
 ])
 
-agent = create_react_agent(llm, tools, checkpointer=memory,prompt=prompt_template)
+agent = create_react_agent(llm, tools, checkpointer=memory, prompt=prompt_template)
 

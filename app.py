@@ -45,12 +45,6 @@ with st.sidebar:
         index=0
     )
 
-    st.markdown("---")
-
-    # 记忆开关
-    use_memory = st.checkbox("🧠 开启连续对话", value=False, help="开启后 Agent 能记住上下文")
-
-    st.markdown("---")
     st.caption("技术栈：Python | LangChain | LangGraph | ChromaDB | Streamlit")
     st.caption("AI 模型：DeepSeek / 阿里云百炼")
 
@@ -110,13 +104,7 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
         tool_expander = st.expander("🔧 查看 Agent 思考过程", expanded=False)
         tool_records = []
 
-        # 决定 thread_id
-        if use_memory:
-            if "memory_thread_id" not in st.session_state:
-                st.session_state.memory_thread_id = f"memory_{uuid.uuid4().hex[:8]}"
-            thread_id = st.session_state.memory_thread_id
-        else:
-            thread_id = str(uuid.uuid4())
+        thread_id ="guide_exam_memory_0001"
 
         # 判断是否需要添加系统消息（首次对话）
         config = {"configurable": {"thread_id": thread_id}}
@@ -169,7 +157,4 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
 # ============================================================
 # 连续对话状态提示
 # ============================================================
-if use_memory:
-    st.sidebar.success("✅ 连续对话模式已开启，Agent 会记住上下文")
-else:
-    st.sidebar.info("ℹ️ 独立问答模式，每次提问都是新的开始")
+st.sidebar.success("✅ 连续对话模式已开启，Agent 会记住上下文")
