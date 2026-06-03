@@ -1,11 +1,7 @@
 import json
 import os
 import re
-# from rank_bm25 import BM25Okapi
-# import jieba
-# from langchain.retrievers import ContextualCompressionRetriever
-# from langchain.retrievers.document_compressors import CrossEncoderReranker
-# from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from difflib import SequenceMatcher
 
 from langchain_community.embeddings import DashScopeEmbeddings
 
@@ -106,7 +102,8 @@ def search_textbook(query: str) -> str:
     参数 query: 用户问题的关键词或完整句子。
     """
     vectorstore = load_vectorstore()
-    docs = vectorstore.similarity_search(query, k=3)
+    docs = vectorstore.similarity_search(query, k=5)
+    docs = deduplicate_docs(docs)  # 去重，保留语义差异较大的片段
     if not docs:
         print("未找到相关教材内容。")
         return "未找到相关教材内容。"
@@ -227,3 +224,20 @@ def grade_answer(question_id: str, student_answer: str) -> str:
 #     if not docs:
 #         return "未找到相关内容。"
 #     return "\n\n".join([doc.page_content for doc in docs])
+
+
+def deduplicate_docs(docs, threshold=0.8):
+    """基于文本相似度去重，只保留内容差异较大的片段"""
+    unique = []
+    for doc in docs:
+        is_dup = False
+        for existing in unique:
+            similarity = SequenceMatcher(
+                None, doc.page_content, existing.page_content
+            ).ratio()
+            if similarity > threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            unique.append(doc)
+    return unique

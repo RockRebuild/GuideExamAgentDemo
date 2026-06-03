@@ -1,12 +1,23 @@
+import random
+import secrets
+
+import redis
 import streamlit as st
 from agent import agent
 from langchain_core.messages import SystemMessage
 import uuid
 import warnings
+import json
+from datetime import datetime
+from functools import partial
+
+
 
 # 屏蔽无关警告，保持界面干净
 warnings.filterwarnings("ignore", message=".*missing ScriptRunContext.*")
 warnings.filterwarnings("ignore", message=".*NoSessionContext.*")
+
+FEEDBACK_FILE = "feedback.json"
 
 st.set_page_config(
     page_title="导游考试 AI 助手",
@@ -14,6 +25,21 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# 复用已有的 Redis 连接（本地默认端口）
+feedback_redis = redis.Redis(host="localhost", port=6379, decode_responses=True)
+
+def save_feedback(question, answer, feedback_type, comment=""):
+    st.write(f"DEBUG: 正在写入反馈，类型={feedback_type}")  # 临时调试
+    """保存反馈到 Redis List"""
+    feedback_data = json.dumps({
+        "question": question,
+        "answer": answer,
+        "feedback": feedback_type,
+        "comment": comment,
+        "timestamp": datetime.now().isoformat()
+    }, ensure_ascii=False)
+    feedback_redis.lpush("feedback:list", feedback_data)
 
 # ============================================================
 # 系统提示词
@@ -45,8 +71,35 @@ with st.sidebar:
         index=0
     )
 
+    # 当模式切换时，清除上一次的反馈状态
+    if "last_mode" not in st.session_state:
+        st.session_state.last_mode = mode
+    elif st.session_state.last_mode != mode:
+        # 模式变了，重置反馈相关状态
+        st.session_state.feedback_state = {}
+        st.session_state.last_prompt = None
+        st.session_state.last_answer = None
+        st.session_state.last_msg_id = None
+        st.session_state.last_mode = mode
+        st.rerun()
+
     st.caption("技术栈：Python | LangChain | LangGraph | ChromaDB | Streamlit")
     st.caption("AI 模型：DeepSeek / 阿里云百炼")
+    # 放在 with st.sidebar 块里
+    # ... 你已有的侧边栏内容 ...
+
+    st.markdown("---")
+    st.subheader("📊 反馈统计")
+    total_feedback = feedback_redis.llen("feedback:list")
+    positive_count = sum(
+        1 for fb in feedback_redis.lrange("feedback:list", 0, -1)
+        if json.loads(fb).get("feedback") == "positive"
+    )
+    if total_feedback > 0:
+        st.metric("总反馈数", total_feedback)
+        st.metric("好评率", f"{positive_count / total_feedback * 100:.0f}%")
+    else:
+        st.caption("暂无反馈数据")
 
 # ============================================================
 # 示例问题（根据模式动态显示）
@@ -91,6 +144,21 @@ st.markdown("---")
 # ============================================================
 if prompt := st.chat_input("请输入你的问题，或点击上方的示例问题..."):
     st.session_state.current_prompt = prompt
+def click_pos():
+
+    save_feedback(prompt, final_answer, "positive")
+    st.session_state.feedback_state[msg_id] = "positive"
+    st.rerun()
+
+def click_neg(msg_id) :
+    # 点踩后弹出评论框
+    st.session_state.feedback_state[msg_id] = "pending_comment"
+    st.rerun()
+
+def click_comment(prompt, final_answer,comment, msg_id) :
+    save_feedback(prompt, final_answer, "negative", comment)
+    st.session_state.feedback_state[msg_id] = "done"
+    st.rerun()
 
 # 处理提示词（可能来自示例按钮或手动输入）
 if "current_prompt" in st.session_state and st.session_state.current_prompt:
@@ -146,6 +214,12 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
             # 显示最终回答
             if final_answer:
                 st.write(final_answer)
+                # ================= 反馈系统 =================
+                # 用 prompt 的哈希值作为这条问答的唯一标识
+                # ========== 修复关键：保存本次问答的状态 ==========
+                st.session_state.last_prompt = prompt
+                st.session_state.last_answer = final_answer
+                st.session_state.last_msg_id = str(hash(prompt))
             else:
                 st.warning("Agent 没有返回回答，请稍后重试。")
 
@@ -158,3 +232,48 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
 # 连续对话状态提示
 # ============================================================
 st.sidebar.success("✅ 连续对话模式已开启，Agent 会记住上下文")
+
+def render_feedback_section():
+    # 1. 从 st.session_state 中获取上一次问答的状态
+    prompt = st.session_state.get("last_prompt")
+    final_answer = st.session_state.get("last_answer")
+    msg_id = st.session_state.get("last_msg_id")
+
+    # 2. 如果还没有发生过任何对话，什么也不渲染
+    if not msg_id:
+        return
+
+    # 3. 初始化或读取当前消息的反馈状态
+    if "feedback_state" not in st.session_state:
+        st.session_state.feedback_state = {}
+
+    fb_state = st.session_state.feedback_state.get(msg_id, None)
+
+    # 4. 根据状态渲染不同的 UI
+    if fb_state is None:
+        # 状态：未反馈 -> 显示点赞/点踩按钮
+        col1, col2, _ = st.columns([1, 1, 4])
+        with col1:
+            if st.button("👍 有用", key=f"pos_{msg_id}"):
+                save_feedback(prompt, final_answer, "positive")
+                st.session_state.feedback_state[msg_id] = "positive"
+                st.rerun()
+        with col2:
+            if st.button("👎 无用", key=f"neg_{msg_id}"):
+                st.session_state.feedback_state[msg_id] = "pending_comment"
+                st.rerun()
+
+    elif fb_state == "pending_comment":
+        # 状态：点踩后待评论 -> 显示评论框
+        comment = st.text_area("请告诉我们哪里回答得不好（可选）：", key=f"comment_{msg_id}")
+        if st.button("提交反馈", key=f"submit_{msg_id}"):
+            save_feedback(prompt, final_answer, "negative", comment)
+            st.session_state.feedback_state[msg_id] = "done"
+            st.rerun()
+
+    else:
+        # 状态：已反馈 -> 显示感谢语
+        st.caption("✅ 感谢你的反馈！")
+
+render_feedback_section()
+
