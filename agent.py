@@ -6,12 +6,11 @@ from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.redis import RedisSaver
 from langgraph.prebuilt import create_react_agent
-from tools import search_questions, search_textbook, grade_answer  # 导入你的工具
-from langgraph.checkpoint.memory import MemorySaver
+from tools import search_questions, search_textbook, grade_answer, hybrid_search, multi_search, rewritten_search, parent_child_search  # 导入你的工具
 from dotenv import load_dotenv
 
 load_dotenv()  # 自动查找并加载项目根目录下的 .env 文件
-memory = RedisSaver(redis_url="redis://localhost:6379")
+memory = RedisSaver(redis_url="redis://redis:6379")
 memory.setup()
 
 
@@ -24,23 +23,55 @@ llm = ChatOpenAI(
 )
 
 # 2. 告诉 Agent 它能用什么工具
-tools = [search_textbook, grade_answer]
+def get_agent_for_mode(mode: str):
+    """根据模式动态创建 Agent，实现工具懒加载"""
+    tools = []
+    if mode == "📖 教材知识问答":
+        tools = [search_textbook, hybrid_search, multi_search,
+                 rewritten_search, parent_child_search]
+    elif mode == "📝 智能出卷":
+        tools = [search_questions]
+    elif mode == "📊 阅卷批改":
+        tools = [search_textbook, grade_answer]   # ← 确保这里有 grade_answer
+    return create_react_agent(llm, tools, checkpointer=memory, prompt=load_system_prompt())
 
-SYSTEM_PROMPT = """
-你是一个导游考试智能助手。你拥有以下工具：
-- search_textbook: 从教材中检索任何内容（知识点、目录、习题等）。
-- grade_answer: 批改学员的答案。
+def load_system_prompt(filepath="prompts/system_prompt.md"):
+    """从 Markdown 文件加载 System Prompt"""
+    with open(filepath, "r", encoding="utf-8") as f:
+        return f.read()
 
-重要规则：
-1. 当用户询问任何与教材相关的内容时，**必须**先调用 search_textbook 工具获取真实内容，不得凭记忆编造。
-2. 如果需要批改，调用 grade_answer。
-4. 严禁在未调用工具的情况下直接回答与教材或题库有关的问题。
-"""
+SYSTEM_PROMPT = load_system_prompt()
 
 prompt_template = ChatPromptTemplate.from_messages([
     ("system", SYSTEM_PROMPT),
     ("placeholder", "{messages}"),
 ])
 
-agent = create_react_agent(llm, tools, checkpointer=memory, prompt=prompt_template)
+# agent = create_react_agent(llm, tools, checkpointer=memory, prompt=prompt_template)
+
+from tenacity import (
+    retry, stop_after_attempt, wait_exponential,
+    retry_if_exception_type, before_sleep_log
+)
+from openai import RateLimitError, APIConnectionError, InternalServerError, APITimeoutError
+import logging
+
+logger = logging.getLogger(__name__)
+
+RETRYABLE = (RateLimitError, APIConnectionError, InternalServerError, APITimeoutError)
+
+def stream_agent_with_retry(agent, messages, config=None):
+    """带重试的流式调用生成器"""
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(RETRYABLE),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
+    def _stream():
+        # 每次重试都重新调用 agent.stream() 获取全新生成器
+        for chunk in agent.stream({"messages": messages}, config=config):
+            yield chunk
+
+    yield from _stream()
 

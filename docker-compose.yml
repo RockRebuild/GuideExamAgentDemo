@@ -1,10 +1,31 @@
 version: '3.8'
 services:
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    restart: always
+    networks:
+      - guide-net
+
   agent:
     build: .
+    container_name: guide-agent
     ports:
       - "8501:8501"
     env_file:
       - .env
     volumes:
       - ./chroma_db:/app/chroma_db
+    depends_on:
+      - redis
+    restart: always
+    networks:
+      - guide-net
+    dns:
+      - 114.114.114.114
+      - 8.8.8.8
+
+networks:
+  guide-net:

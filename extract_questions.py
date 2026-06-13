@@ -11,22 +11,75 @@ for page in reader.pages:
         # 按行拆分，保留空行用于判断段落边界
         lines.extend(text.split('\n'))
 
-# 2. 状态机解析
-questions = []
-current = None  # 当前正在构建的题目
-state = "idle"  # idle / in_question / in_options / in_explanation
-option_buffer = []
-question_buffer = []
+def merge_wrapped_chapter_titles(lines):
+    """合并跨行的章标题，更稳健的版本"""
+    merged = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        # 检测章标题开始（第X章、第XX章、第X篇、第X部分等）
+        if re.match(r'^第[一二三四五六七八九十\d]+(章|篇|部分)', line):
+            combined = line
+            i += 1
+            # 持续合并后续非空行，直到遇到明显的非标题内容
+            while i < len(lines):
+                next_line = lines[i].strip()
+                if not next_line:  # 跳过空行
+                    i += 1
+                    continue
+                # 终止条件：题目开始、选项、解析、答案、新章节、明显不是标题的内容（如数字开头）
+                if (re.match(r'^\d+\.', next_line) or
+                    re.match(r'^[A-D][.．]', next_line) or
+                    re.match(r'^第[一二三四五六七八九十\d]+(章|篇|部分)', next_line) or
+                    next_line.startswith('【解析】') or
+                    next_line.startswith('答案') or
+                    next_line.startswith('参考答案') or
+                    re.match(r'^\d+', next_line)):
+                    break
+                # 如果下一行看起来像标题的续行（不是题目），就合并
+                combined += ' ' + next_line
+                i += 1
+                # 如果合并后已经比较长，或者以标点结束，可提前停止
+                if len(combined) > 40 or re.search(r'[。！？]$', combined):
+                    break
+            merged.append(combined)
+        else:
+            merged.append(line)
+            i += 1
+    return merged
 
-def save_current():
-    """保存当前题目并重置"""
-    global current, state, option_buffer, question_buffer
-    if current and current.get("question") and current.get("options"):
-        questions.append(current)
-    current = None
-    state = "idle"
-    option_buffer = []
-    question_buffer = []
+# 应用预处理
+lines = merge_wrapped_chapter_titles(lines)
+
+# 2. 状态机解析
+class QuestionParser:
+    def __init__(self):
+        self.current = None
+        self.state = "idle"
+        self.option_buffer = []
+        self.question_buffer = []
+        self.chapter_type_counter = {}
+        self.current_chapter = "未知章节"
+        self.current_subject = "未知科目"   # 新增：当前科目
+        self.questions = []
+
+    def save_current(self):
+        if self.current and self.current.get("question") and self.current.get("options"):
+            subject = self.current.get("subject", "未知科目")
+            chapter = self.current.get("chapter", "未知章节")
+            qtype = self.current.get("type", "未知题型")
+            key = (subject, chapter, qtype)
+            self.chapter_type_counter[key] = self.chapter_type_counter.get(key, 0) + 1
+            index = self.chapter_type_counter[key]
+            # 生成唯一ID
+            self.current["id"] = f"{subject}_{chapter}_{qtype}_{index}"
+            self.questions.append(self.current)
+        self.current = None
+        self.state = "idle"
+        self.option_buffer = []
+        self.question_buffer = []
+
+parser = QuestionParser()
 
 for line in lines:
     line = line.strip()
@@ -38,85 +91,97 @@ for line in lines:
         continue
     if '出版说明' in line or 'ISBN' in line or 'Digitized by' in line:
         continue
+    # 检测科目标题，例如 "科目一 政策法规" 或 "科目1"
+    subj_match = re.match(r'^科目[一二三四五六七八九十\d]+', line)
+    if subj_match:
+        parser.current_subject = line.strip()
+        continue
     if re.match(r'^第[一二三四五六七八九十\d]+章', line) and '参考答案' not in line:
+        parser.current_chapter = line.strip()  # 记录当前章节名
         continue
 
     # 检测题目开始：数字 + . + ［题型］
     q_start = re.match(r'^(\d+)\.\s*[\[［]([^\]］]+)[\]］]\s*(.*)', line)
     if q_start:
-        save_current()
-        q_number = q_start.group(1)
+        parser.save_current()
         q_type = q_start.group(2)
         # 统一题型
         if '单选' in q_type: q_type = '单选'
         elif '多选' in q_type: q_type = '多选'
         elif '判断' in q_type: q_type = '判断'
         rest = q_start.group(3)
-        current = {
-            "id": f"q_{int(q_number):03d}",
+        parser.current = {
+            "id": "",
             "type": q_type,
-            "chapter": "待整理",
+            "subject": parser.current_subject,   # 新增科目
+            "chapter": parser.current_chapter,
             "question": rest,
             "options": [],
             "answer": "",
             "explanation": ""
         }
-        question_buffer = [rest]
-        state = "in_question"
+        parser.question_buffer = [rest]
+        parser.state = "in_question"
         continue
 
     # 如果还没开始任何题目，跳过
-    if current is None:
+    if parser.current is None:
         continue
 
     # 检测选项开始：以 A. 或 A． 开头
     if re.match(r'^[A-D][.．]', line):
         state = "in_options"
-        option_buffer.append(line)
-        # 如果一行包含多个选项（如 "A.xxx　　B.xxx"），拆分
         if re.search(r'[A-D][.．].*[A-D][.．]', line):
+            # 一行包含多个选项，拆分后逐个追加
             parts = re.split(r'(?=[A-D][.．])', line)
-            option_buffer = [p.strip() for p in parts if p.strip()]
+            for p in parts:
+                p = p.strip()
+                if p and re.match(r'^[A-D][.．]', p):
+                    parser.option_buffer.append(p)
+        else:
+            # 单个选项直接追加
+            parser.option_buffer.append(line)
         continue
 
     # 检测解析开始
     if line.startswith('【解析】') or line.startswith('【答案】') or line.startswith('答案'):
-        state = "in_explanation"
+        parser.state = "in_explanation"
         # 保存之前收集的选项
-        if option_buffer:
-            current["options"] = option_buffer[:4]  # 只取前4个选项
-            option_buffer = []
+        if parser.option_buffer:
+            parser.current["options"] = parser.option_buffer[:4]  # 只取前4个选项
+            parser.option_buffer = []
         # 如果是解析行
         if '【解析】' in line:
-            current["explanation"] = line.replace('【解析】', '').strip()
+            parser.current["explanation"] = line.replace('【解析】', '').strip()
         # 如果是答案行
         if '答案' in line:
             ans = re.search(r'答案[：:]\s*([A-D对错√×]+)', line)
             if ans:
-                current["answer"] = ans.group(1)
+                parser.current["answer"] = ans.group(1)
         continue
 
     # 根据状态处理
-    if state == "in_question":
+    if parser.state == "in_question":
         # 题干可能跨多行
-        question_buffer.append(line)
-        current["question"] = ' '.join(question_buffer)
+        parser.question_buffer.append(line)
+        parser.current["question"] = ' '.join(parser.question_buffer)
 
-    elif state == "in_options":
+    elif parser.state == "in_options":
         # 继续收集选项
-        option_buffer.append(line)
+        parser.option_buffer.append(line)
 
-    elif state == "in_explanation":
+    elif parser.state == "in_explanation":
         # 解析可能跨多行
         if '答案' in line:
             ans = re.search(r'答案[：:]\s*([A-D对错√×]+)', line)
             if ans:
-                current["answer"] = ans.group(1)
+                parser.current["answer"] = ans.group(1)
         else:
-            current["explanation"] += line
+            parser.current["explanation"] += line
 
-# 保存最后一道题
-save_current()
+# 循环结束后，保存最后一道题
+parser.save_current()
+questions = parser.questions
 
 # 3. 后处理：清理选项格式
 for q in questions:

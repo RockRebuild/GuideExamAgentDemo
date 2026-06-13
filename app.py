@@ -1,15 +1,19 @@
-import random
-import secrets
+import asyncio
+import hashlib
+from typing import Dict, Any
 
 import redis
 import streamlit as st
-from agent import agent
+
+from llm_service import LLMService
+from agent import stream_agent_with_retry, SYSTEM_PROMPT, get_agent_for_mode
 from langchain_core.messages import SystemMessage
-import uuid
 import warnings
 import json
-from datetime import datetime
-from functools import partial
+from datetime import datetime, date
+
+AGENT_SEMAPHORE = asyncio.Semaphore(3)
+
 
 
 
@@ -18,7 +22,6 @@ warnings.filterwarnings("ignore", message=".*missing ScriptRunContext.*")
 warnings.filterwarnings("ignore", message=".*NoSessionContext.*")
 
 FEEDBACK_FILE = "feedback.json"
-
 st.set_page_config(
     page_title="导游考试 AI 助手",
     page_icon="📝",
@@ -26,8 +29,63 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+MAX_INPUT_LENGTH = 500          # 限制用户输入字符数
+BLOCKED_KEYWORDS = [            # 敏感词清单（可根据需要扩充）
+    "system", "忽略", "ignore",
+    "忘记", "重新开始", "越狱",
+    "你是一个", "你的prompt",
+    "你的system", "把你的指令给我"
+]
+
+mode = st.sidebar.radio("选择模式", ["📖 教材知识问答", "📝 智能出卷", "📊 阅卷批改"])
+agent = get_agent_for_mode(mode)
+# 动态获取 Agent
+
+def sanitize_input(user_input: str) -> tuple[str, str | None]:
+    """
+    输入过滤：长度截断 + 敏感词检测
+    返回 (处理后的输入, 错误信息)
+    """
+    # 长度检查
+    if len(user_input) > MAX_INPUT_LENGTH:
+        return user_input[:MAX_INPUT_LENGTH], f"输入已自动截断至 {MAX_INPUT_LENGTH} 字符"
+
+    # 敏感词检查
+    lower_input = user_input.lower()
+    for keyword in BLOCKED_KEYWORDS:
+        if keyword in lower_input:
+            return "", f"检测到不当关键词 '{keyword}'，请求被拒绝。如有疑问请联系管理员。"
+
+    return user_input, None
+
 # 复用已有的 Redis 连接（本地默认端口）
-feedback_redis = redis.Redis(host="localhost", port=6379, decode_responses=True)
+feedback_redis = redis.Redis(host="redis", port=6379, decode_responses=True)
+llm_service = LLMService(agent=agent, redis_client=feedback_redis)
+
+async def async_stream_agent(messages: list, config: Dict[str, Any] | None = None):
+    """
+    异步流式调用 Agent，自动受 Semaphore 控制。
+    返回异步生成器，每次 yield 一个 chunk。
+    """
+    async with AGENT_SEMAPHORE:
+        async for chunk in agent.astream(
+            {"messages": messages},
+            config=config
+        ):
+            yield chunk
+
+def run_async_stream(messages: list, config: Dict[str, Any] | None = None):
+    """
+    同步调用异步流式 Agent，并逐块返回结果。
+    """
+    async def _run():
+        result_chunks = []
+        async for chunk in async_stream_agent(messages, config):
+            result_chunks.append(chunk)
+        return result_chunks
+
+    # 在事件循环中执行异步任务，并返回结果列表
+    return asyncio.run(_run())
 
 def save_feedback(question, answer, feedback_type, comment=""):
     st.write(f"DEBUG: 正在写入反馈，类型={feedback_type}")  # 临时调试
@@ -42,34 +100,11 @@ def save_feedback(question, answer, feedback_type, comment=""):
     feedback_redis.lpush("feedback:list", feedback_data)
 
 # ============================================================
-# 系统提示词
-# ============================================================
-SYSTEM_PROMPT = """
-你是一个导游考试智能助手，可以帮助用户完成以下任务：
-- 查询教材知识点（使用 search_textbook 工具）
-- 检索考试题目（使用 search_questions 工具）
-- 批改学员答案（使用 grade_answer 工具）
-
-重要规则：
-1. 当用户询问任何与教材相关的内容时，必须调用 search_textbook 获取真实内容，严禁自己编造。
-2. 当用户要求出题、找题目时，必须调用 search_questions 获取真实题目。
-3. 当用户要求批改题目时，必须调用 grade_answer。
-4. 批改完如果学员答错，应主动调用 search_textbook 帮学员复习相关知识点。
-"""
-
-# ============================================================
 # 侧边栏配置
 # ============================================================
 with st.sidebar:
     st.title("📝 导游考试 AI 助手")
     st.markdown("---")
-
-    # 模式选择
-    mode = st.radio(
-        "选择模式",
-        ["📖 教材知识问答", "📝 智能出卷", "📊 阅卷批改"],
-        index=0
-    )
 
     # 当模式切换时，清除上一次的反馈状态
     if "last_mode" not in st.session_state:
@@ -106,9 +141,9 @@ with st.sidebar:
 # ============================================================
 sample_questions = {
     "📖 教材知识问答": [
-        "地陪导游在接团前需要准备哪些证件？",
+        "政策与法律法规的第二章主要讲了什么？",
         "全陪导游的职责是什么？",
-        "《旅游法》规定了旅游者的哪些权利？",
+        "《旅游法》第35条是什么？",
         "导游证的种类有哪些？"
     ],
     "📝 智能出卷": [
@@ -117,8 +152,8 @@ sample_questions = {
         "出五道判断题，范围是政策法规",
     ],
     "📊 阅卷批改": [
-        "请批改题目 q_001，我的答案是 B",
-        "帮我批改题目 q_003，我选 A",
+        "请批改题目 科目一的第一章单选第一题，我的答案是 B",
+        "帮我批改题目 科目四的第十章多选第三题，我选 A，B",
     ]
 }
 
@@ -142,9 +177,33 @@ st.markdown("---")
 # ============================================================
 # 聊天输入
 # ============================================================
+
+def cached_qa_answer(query: str) -> str | None:
+    """
+    检查是否为完全相同的问题，如果是，返回缓存的最终答案。
+    缓存键 = MD5(query)，过期时间 1 小时。
+    """
+    query_hash = hashlib.md5(query.encode()).hexdigest()
+    cache_key = f"qa_cache:{query_hash}"
+    cached = feedback_redis.get(cache_key)
+    if cached:
+        return cached.decode()
+    return None
+
+def cache_qa_answer(query: str, answer: str, expire: int = 300):
+    """缓存问答对"""
+    query_hash = hashlib.md5(query.encode()).hexdigest()
+    cache_key = f"qa_cache:{query_hash}"
+    feedback_redis.setex(cache_key, expire, answer)
+
 if prompt := st.chat_input("请输入你的问题，或点击上方的示例问题..."):
+    sanitized, error_msg = sanitize_input(prompt)
+    if error_msg:
+        st.warning(error_msg)   # 显示拦截提示，不调用 Agent
+        st.stop()
+    prompt = sanitized          # 使用过滤后的输入
     st.session_state.current_prompt = prompt
-def click_pos():
+def click_pos(msg_id):
 
     save_feedback(prompt, final_answer, "positive")
     st.session_state.feedback_state[msg_id] = "positive"
@@ -171,8 +230,9 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
         # 工具调用展示
         tool_expander = st.expander("🔧 查看 Agent 思考过程", expanded=False)
         tool_records = []
+        answer_placeholder = st.empty()
 
-        thread_id ="guide_exam_memory_0001"
+        thread_id ="guide_exam_memory_0004"
 
         # 判断是否需要添加系统消息（首次对话）
         config = {"configurable": {"thread_id": thread_id}}
@@ -188,11 +248,13 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
 
         # 调用 Agent
         try:
+            chunks = []  # 收集所有 chunk
             final_answer = ""
-            for chunk in agent.stream(
-                {"messages": messages},
-                config=config
+            for chunk in stream_agent_with_retry(agent,
+                messages,
+                config
             ):
+                chunks.append(chunk)  # 保存下来，后续提取 Token
                 if "tools" in chunk:
                     tool_msg = chunk["tools"]["messages"][0]
                     tool_records.append(
@@ -200,8 +262,12 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
                         f"输入参数：{tool_msg.content}"
                     )
                 if "agent" in chunk:
-                    final_answer = chunk["agent"]["messages"][0].content
+                    final_answer += chunk["agent"]["messages"][0].content
+                    answer_placeholder.markdown(final_answer)  # 实时更新显示
 
+            # 流式结束后，提取 Token 并写入 Redis
+            input_tok, output_tok = llm_service.extract_token_usage_from_stream(chunks)
+            llm_service._record_usage(input_tok, output_tok)
             # 显示工具调用过程
             with tool_expander:
                 if tool_records:
@@ -213,9 +279,8 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
 
             # 显示最终回答
             if final_answer:
-                st.write(final_answer)
                 # ================= 反馈系统 =================
-                # 用 prompt 的哈希值作为这条问答的唯一标识
+                # 用 prompts 的哈希值作为这条问答的唯一标识
                 # ========== 修复关键：保存本次问答的状态 ==========
                 st.session_state.last_prompt = prompt
                 st.session_state.last_answer = final_answer
@@ -275,5 +340,15 @@ def render_feedback_section():
         # 状态：已反馈 -> 显示感谢语
         st.caption("✅ 感谢你的反馈！")
 
+def generate_chunks(agent, messages, config):
+    """将 agent.stream 包装成文本生成器"""
+    for chunk in agent.stream({"messages": messages}, config=config):
+        if "agent" in chunk:
+            yield chunk["agent"]["messages"][0].content
+        # 如果有工具调用，可以选择不输出，或者另外展示
+
 render_feedback_section()
+llm_service.sidebar_usage()
+
+
 
