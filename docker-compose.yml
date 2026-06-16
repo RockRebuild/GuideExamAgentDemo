@@ -27,5 +27,14 @@ services:
       - 114.114.114.114
       - 8.8.8.8
 
+  weather-mcp:
+    build: .
+    command: pdm run python weather_server.py
+    ports:
+      - "8000:8000"
+    networks:
+      - guide-net
+
 networks:
   guide-net:
+    external: true   # 使用宿主机上已创建的网络

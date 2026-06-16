@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 from typing import Dict, Any
 
 import redis
@@ -11,7 +12,6 @@ from langchain_core.messages import SystemMessage
 import warnings
 import json
 from datetime import datetime, date
-
 AGENT_SEMAPHORE = asyncio.Semaphore(3)
 
 
@@ -36,6 +36,22 @@ BLOCKED_KEYWORDS = [            # 敏感词清单（可根据需要扩充）
     "你是一个", "你的prompt",
     "你的system", "把你的指令给我"
 ]
+
+
+
+
+
+def trace_agent_call(user_input: str, stream_func):
+
+    try:
+        # 执行你的流式 Agent 调用（你的 stream_agent_with_retry 等）
+        final_answer = ""
+        for chunk in stream_func():
+            if "agent" in chunk:
+                final_answer = chunk["agent"]["messages"][0].content
+        return final_answer
+    except Exception as e:
+        raise
 
 mode = st.sidebar.radio("选择模式", ["📖 教材知识问答", "📝 智能出卷", "📊 阅卷批改"])
 agent = get_agent_for_mode(mode)
@@ -292,7 +308,6 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
             import traceback
             traceback.print_exc()
             st.error(f"Agent 调用失败：{str(e)[:300]}")
-
 # ============================================================
 # 连续对话状态提示
 # ============================================================

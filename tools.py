@@ -1,20 +1,28 @@
+import asyncio
 import json
 import os
 import re
+import sys
 from difflib import SequenceMatcher
 from typing import Optional, List
 
+import httpx
 import numpy as np
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
+from mcp import StdioServerParameters, stdio_client, ClientSession
 from rank_bm25 import BM25Okapi
 import jieba
 
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_chroma import Chroma
-from langchain_core.tools import tool
+from langchain_core.tools import tool, StructuredTool
 from langchain_core.documents import Document
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from typing import List
+print("=== tools.py 开始执行 ===", file=sys.stderr, flush=True)
+
 
 # ============================================================
 # 全局配置
@@ -354,3 +362,55 @@ def rewritten_search(original_query: str, k: int = 3) -> str:
         return "未找到相关内容。"
     results = [f"【片段{i + 1}】\n{doc.page_content}" for i, doc in enumerate(unique_docs)]
     return "\n\n".join(results)
+
+
+async def _load_mcp_tools_http_async(url: str) -> List[StructuredTool]:
+    """异步加载 HTTP 模式的 MCP 工具"""
+    tools = []
+    # 连接到 HTTP MCP Server
+    client = httpx.AsyncClient(base_url=url)
+
+    # 获取工具列表
+    resp = await client.post("/mcp", json={"method": "tools/list"})
+    data = resp.json()
+
+    for tool_def in data.get("tools", []):
+        # 为每个工具创建同步调用函数
+        def make_sync_call(name=tool_def["name"], desc=tool_def.get("description", ""),
+                           input_schema=tool_def.get("inputSchema", {})):
+            def sync_call(**kwargs):
+                async def _call():
+                    async with httpx.AsyncClient(base_url=url) as c:
+                        resp = await c.post("/mcp", json={
+                            "method": "tools/call",
+                            "params": {
+                                "name": name,
+                                "arguments": kwargs
+                            }
+                        })
+                        result = resp.json()
+                        # 提取文本内容
+                        content = result.get("content", [])
+                        if content:
+                            return content[0].get("text", str(result))
+                        return str(result)
+
+                return asyncio.run(_call())
+
+            return sync_call
+
+        tools.append(
+            StructuredTool.from_function(
+                func=make_sync_call(tool_def["name"], tool_def.get("description", ""),
+                                    tool_def.get("inputSchema", {})),
+                name=tool_def["name"],
+                description=tool_def.get("description", ""),
+                # 简单构造 args_schema，这里直接传 None 让 LangChain 自动推断
+            )
+        )
+    return tools
+
+
+def load_mcp_tools_http(url: str) -> List[StructuredTool]:
+    """同步入口，加载 HTTP MCP 工具"""
+    return asyncio.run(_load_mcp_tools_http_async(url))
