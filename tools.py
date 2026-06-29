@@ -28,7 +28,7 @@ print("=== tools.py 开始执行 ===", file=sys.stderr, flush=True)
 # 全局配置
 # ============================================================
 CHROMA_PERSIST_DIR = "./chroma_db"
-COLLECTION_PARAGRAPH = "guide_textbook"   # 段落级索引（细粒度，用于语义/混合检索）
+COLLECTION_PARAGRAPH = "guide_child"   # 段落级索引（细粒度，用于语义/混合检索）
 COLLECTION_SUMMARY = "guide_summary"       # 摘要级索引（粗粒度，用于快速定位章节）
 COLLECTION_SENTENCE = "guide_sentence"     # 命题/句子级索引（预留，需另行生成）
 
@@ -143,7 +143,7 @@ def initialize_vectorstores(pdf_path: str = "全国导游人员资格统一考�
 # ============================================================
 
 @tool
-def hybrid_search(query: str, k: int = 5) -> str:
+def hybrid_search(query: str, k: int = 8) -> str:
     """
     混合检索教材内容，结合语义搜索和关键词搜索。
     当用户询问任何与教材相关的问题时，优先使用本工具。
@@ -186,7 +186,7 @@ def search_textbook(query: str) -> str:
     当用户询问教材相关问题时优先使用。
     """
     para_store = get_vectorstore(COLLECTION_PARAGRAPH)
-    docs_with_scores = para_store.similarity_search_with_relevance_scores(query, k=5)
+    docs_with_scores = para_store.similarity_search_with_relevance_scores(query, k=8)
     relevant_docs = [doc for doc, score in docs_with_scores if score > 0.5]
     if not relevant_docs:
         return "未在教材中找到与您问题相关的内容。"
@@ -292,13 +292,13 @@ def grade_answer(question_id: Optional[str] = None,
     return result
 
 @tool
-def parent_child_search(query: str, k: int = 3) -> str:
+def parent_child_search(query: str, k: int = 8) -> str:
     """
     父子切片检索：用细粒度子切片匹配，返回大粒度父切片供 LLM 阅读。
     适用场景：需要精准匹配但又要完整上下文的查询。
     """
     try:
-        child_store = get_vectorstore("guide_textbook")
+        child_store = get_vectorstore("guide_child")
         parent_store = get_vectorstore("guide_parent")
 
         # 1. 子切片检索（多召回一些）
@@ -332,7 +332,7 @@ def parent_child_search(query: str, k: int = 3) -> str:
 
 
 @tool
-def rewritten_search(original_query: str, k: int = 3) -> str:
+def rewritten_search(original_query: str, k: int = 8) -> str:
     """
     问题改写检索：将用户问题改写为多个变体后并行检索，提高召回率。
     适用场景：用户问题模糊、口语化，或需要多角度覆盖时。
