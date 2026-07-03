@@ -21,10 +21,12 @@ COLLECTION_NAME = "guide_summary"
 
 # 模型配置
 SUMMARY_MODEL = ChatOpenAI(
-    model="deepseek-chat",
+    model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
     base_url="https://api.deepseek.com/v1",
     api_key=os.environ.get("DEEPSEEK_API_KEY"),
     temperature=0,
+    # 显式关闭思考模式，等价于旧 deepseek-chat 的非思考行为
+    extra_body={"thinking": {"type": "disabled"}},
 )
 embeddings = DashScopeEmbeddings(model="text-embedding-v3")
 

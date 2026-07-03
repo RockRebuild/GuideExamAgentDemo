@@ -338,10 +338,12 @@ def rewritten_search(original_query: str, k: int = 8) -> str:
     适用场景：用户问题模糊、口语化，或需要多角度覆盖时。
     """
     llm = ChatOpenAI(
-        model="deepseek-chat",
+        model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         base_url="https://api.deepseek.com/v1",
         api_key=os.environ.get("DEEPSEEK_API_KEY"),
         temperature=0,
+        # 显式关闭思考模式，等价于旧 deepseek-chat 的非思考行为
+        extra_body={"thinking": {"type": "disabled"}},
     )
     rewrite_prompt = f"""将以下用户问题改写成 3 个不同角度的检索查询，每个查询占一行，不要编号和其他文字：
 原始问题：{original_query}

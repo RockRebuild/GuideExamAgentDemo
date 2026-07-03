@@ -18,12 +18,17 @@ memory = RedisSaver(redis_url="redis://redis:6379")
 memory.setup()
 
 
+# 模型名集中由 DEEPSEEK_MODEL 控制，默认 deepseek-v4-flash（旧 deepseek-chat 2026-07-24 下线）
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+
 llm = ChatOpenAI(
-    model="deepseek-chat",
+    model=DEEPSEEK_MODEL,
     base_url="https://api.deepseek.com/v1",  # 必须加 /v1
     api_key=os.environ.get("DEEPSEEK_API_KEY"),
     temperature=0,
-    streaming=True
+    streaming=True,
+    # 显式关闭思考模式，等价于旧 deepseek-chat 的非思考行为
+    extra_body={"thinking": {"type": "disabled"}},
 )
 
 def load_system_prompt(filepath="prompts/system_prompt.md"):

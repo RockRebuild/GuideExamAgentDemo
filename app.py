@@ -169,6 +169,7 @@ elif st.session_state.last_mode != mode:
     st.session_state.last_msg_id = None
     st.session_state.last_mode = mode
     st.session_state.last_ragas_scores = None
+    st.session_state.pending_eval_context = None
     st.rerun()
 
 with st.sidebar:
@@ -194,14 +195,23 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("📊 本次回答评估")
 
+    # 指标中文名及悬停说明
+    _METRIC_LABELS = {
+        "faithfulness":       ("忠实度", "回答是否忠实于检索到的上下文，是否存在幻觉或曲解原文。"),
+        "answer_relevancy":   ("答案相关性", "回答与用户问题的相关程度，是否偏离问题或答非所问。"),
+        "context_precision":  ("上下文精度", "检索到的上下文中，真正对回答有用的比例。信号噪声比。"),
+        "context_recall":     ("上下文召回", "回答中涉及的知识点，有多少被检索到的上下文覆盖。"),
+    }
+
     if "last_ragas_scores" in st.session_state and st.session_state.last_ragas_scores:
         for metric, score in st.session_state.last_ragas_scores.items():
-            # 提取数值，Ragas 返回的可能是 MetricResult 对象
             numeric_score = float(score) if not isinstance(score, (int, float)) else score
             color = "green" if numeric_score >= 0.9 else "orange" if numeric_score >= 0.7 else "red"
-            st.metric(label=metric, value=f"{numeric_score:.0%}", delta_color=color)
+            dot = "🟢" if color == "green" else "🟠" if color == "orange" else "🔴"
+            label_cn, label_help = _METRIC_LABELS.get(metric, (metric, ""))
+            st.metric(label=f"{dot} {label_cn}", value=f"{numeric_score:.0%}", help=label_help)
     else:
-        st.caption("暂无评估数据，回答问题后自动评估")
+        st.caption("暂无评估数据，点击回答下方的评估按钮开始")
 
 # ======================= 示例问题 =======================
 sample_questions = {
@@ -240,6 +250,7 @@ if prompt := st.chat_input("请输入你的问题，或点击上方的示例问�
         st.warning(error_msg)
         st.stop()
     prompt = sanitized
+    st.session_state.pending_eval_context = None
     st.session_state.current_prompt = prompt
 
 # 处理来自按钮或输入的提示词
@@ -315,16 +326,16 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
                 st.session_state.last_answer = final_answer
                 st.session_state.last_msg_id = str(hash(prompt))
 
-                # 实时 RAGAS 评估
+                # 存储评估上下文，等待用户手动点击评估按钮
                 if contexts:
-                    final_contexts = refine_and_rerank(contexts, prompt, top_k=5)
-                    with st.spinner("🔍 正在评估回答质量..."):
-                        st.write("Debug: final_contexts", final_contexts)  # 临时加这一行
-                        st.write("Debug: lengths", [len(ctx) for ctx in final_contexts])
-
-                        scores = evaluate_current_answer(prompt, final_answer, contexts)
-                        st.session_state.last_ragas_scores = scores
+                    st.session_state.pending_eval_context = {
+                        "prompt": prompt,
+                        "answer": final_answer,
+                        "contexts": contexts
+                    }
+                    st.session_state.last_ragas_scores = None
                 else:
+                    st.session_state.pending_eval_context = None
                     st.session_state.last_ragas_scores = None
             else:
                 st.warning("Agent 没有返回回答，请稍后重试。")
@@ -371,6 +382,18 @@ def render_feedback_section():
         st.caption("✅ 感谢你的反馈！")
 
 render_feedback_section()
+
+# ======================= RAG 评估按钮 =======================
+if "pending_eval_context" in st.session_state and st.session_state.pending_eval_context:
+    st.markdown("---")
+    if st.button("🔍 评估回答质量", type="secondary"):
+        ctx = st.session_state.pending_eval_context
+        with st.spinner("🔍 正在评估回答质量..."):
+            final_contexts = refine_and_rerank(ctx["contexts"], ctx["prompt"], top_k=5)
+            scores = evaluate_current_answer(ctx["prompt"], ctx["answer"], final_contexts)
+            st.session_state.last_ragas_scores = scores
+        del st.session_state.pending_eval_context
+        st.rerun()
 
 # Token 使用量侧边栏展示
 llm_service.sidebar_usage()
