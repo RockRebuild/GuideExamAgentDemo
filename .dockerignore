@@ -1,7 +1,17 @@
 venv/
 chroma_db/
+chat_logs/
 __pycache__/
 .git/
+.claude/
+.idea/
+.vscode/
 .env
 *.pyc
+*.pdf
+*.log
 README.md
+*.swp
+*.swo
+.pdm-python
+eval_log.jsonl

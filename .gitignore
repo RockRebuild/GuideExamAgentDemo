@@ -34,3 +34,10 @@ __pycache__/
 
 # Claude 工作文件
 .claude/
+
+# PDM 本地配置
+.pdm-python
+
+# 本地日志
+error.log
+*.log

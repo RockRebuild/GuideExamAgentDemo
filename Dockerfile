@@ -19,7 +19,7 @@ RUN pdm config pypi.url "https://mirrors.aliyun.com/pypi/simple/"
 COPY pyproject.toml pdm.lock ./
 
 # 关键：一次性安装所有依赖（包括 torch 和 transformers）
-RUN pdm install --prod --no-lock --no-self
+RUN pdm install --prod --no-self
 
 # 拷贝模型文件夹（已下载的 BGE-Reranker）
 COPY bge_reranker_cache ./bge_reranker_cache
