@@ -13,16 +13,16 @@
 
 ## 🛠️ 技术栈
 
-| 层次           | 技术                                     |
-| -------------- | ---------------------------------------- |
-| **框架**       | LangChain, LangGraph                     |
-| **大语言模型** | DeepSeek (Chat)                          |
-| **向量数据库** | ChromaDB                                 |
-| **嵌入模型**   | 阿里云百炼 DashScope (text-embedding-v3) |
-| **前端**       | Streamlit                                |
-| **文档处理**   | PyPDF, RecursiveCharacterTextSplitter    |
-| **工具调用**   | @tool 装饰器, 自定义工具函数             |
-| **环境管理**   | Python 3.11, venv, pip                   |
+| 层次           | 技术                                    |
+| -------------- |---------------------------------------|
+| **框架**       | LangChain, LangGraph                  |
+| **大语言模型** | DeepSeek (Chat)                       |
+| **向量数据库** | ChromaDB                              |
+| **嵌入模型**   | 阿里云百炼 DashScope (text-embedding-v4)   |
+| **前端**       | Streamlit                             |
+| **文档处理**   | PyPDF, RecursiveCharacterTextSplitter |
+| **工具调用**   | @tool 装饰器, 自定义工具函数                    |
+| **环境管理**   | Python 3.11, venv, pip                |
 
 ## 🏗️ 架构图
 

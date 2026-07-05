@@ -1,4 +1,4 @@
-# generate_summaries_single.py
+# generate_summaries_all.py
 import os
 import re
 from pypdf import PdfReader
@@ -9,17 +9,35 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ================= 📌 每次修改这里 =================
-PDF_PATH = "政策与法律法规统编教材.pdf"   # 当前这本书的 PDF 路径
-BOOK_NAME = "政策与法律法规统编教材"       # 当前这本书的书名
-START_PAGE = 3                            # 跳过前言等页面
-# ==================================================
+# ================= 📌 四本教材配置 =================
+BOOKS = [
+    {
+        "pdf_path": "导游业务统编教材.pdf",
+        "book_name": "导游业务统编教材",
+        "start_page": 4,
+    },
+    {
+        "pdf_path": "地方导游基础知识统编教材.pdf",
+        "book_name": "地方导游基础知识统编教材",
+        "start_page": 2,
+    },
+    {
+        "pdf_path": "全国导游基础知识统编教材.pdf",
+        "book_name": "全国导游基础知识统编教材",
+        "start_page": 3,
+    },
+    {
+        "pdf_path": "政策与法律法规统编教材.pdf",
+        "book_name": "政策与法律法规统编教材",
+        "start_page": 4,
+    },
+]
 
-# 摘要库配置
+# ================= 公共配置 =================
 CHROMA_PERSIST_DIR = "./chroma_db"
 COLLECTION_NAME = "guide_summary"
 
-# 模型配置
+# 摘要生成模型
 SUMMARY_MODEL = ChatOpenAI(
     model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
     base_url="https://api.deepseek.com/v1",
@@ -28,23 +46,45 @@ SUMMARY_MODEL = ChatOpenAI(
     # 显式关闭思考模式，等价于旧 deepseek-chat 的非思考行为
     extra_body={"thinking": {"type": "disabled"}},
 )
-embeddings = DashScopeEmbeddings(model="text-embedding-v3")
 
+# 嵌入模型
+embeddings = DashScopeEmbeddings(model="text-embedding-v4")
+
+# 全局 Chroma 存储（只创建一次）
+summary_store = Chroma(
+    persist_directory=CHROMA_PERSIST_DIR,
+    embedding_function=embeddings,
+    collection_name=COLLECTION_NAME,
+)
 
 # ================= 广告清洗 =================
 def clean_ad_lines(text: str) -> str:
     ad_patterns = [
+        # 原有规则
         r"微信公众号\s*：\s*daoyoukaoshizhongxin",
         r"微信客服\s*：\s*daoyoukaoshipeixun",
         r"QQ\s*:\s*17059435",
-        r"下边的\s*微信\s*公众\s*号\s*和\s*客服\s*不要添加\s*[！!]\s*是机构\s*[（(]口碑不好[）)]\s*[！!]{1,2}\s*不是我\s*[！!]{1,2}",
+
+        # 增强规则：匹配包含“微信公众号”、“微信客服”、“QQ”等短行的完整行
+        r"^.{0,10}(微信公众号|微信客服|QQ\s*:|扫码加好友|添加微信).{0,30}$",
+        r"下边的\s*微信\s*公众\s*号\s*和\s*客服\s*不要添加\s*[！!].*",
+        r"是机构.{0,10}口碑不好.{0,10}不是我.{0,5}",
+
+        # 超强规则：如果一行同时包含数字、联系方式和机构名，直接删除
+        r"^\s*\d{5,}\s*$",  # 纯数字行（可能是QQ号）
+        r"微信号\s*[：:]\s*\w+",
+        r"扫\s*码\s*添\s*加",
     ]
     lines = text.split("\n")
     cleaned = []
     for line in lines:
-        if any(re.search(p, line, re.IGNORECASE) for p in ad_patterns):
-            continue
-        cleaned.append(line)
+        is_ad = False
+        for p in ad_patterns:
+            if re.search(p, line, re.IGNORECASE):
+                is_ad = True
+                break
+        if not is_ad:
+            cleaned.append(line)
     return "\n".join(cleaned)
 
 
@@ -65,15 +105,12 @@ def extract_chapter_texts(pdf_path: str,
     lines = full_text.split('\n')
 
     # 正则：严格匹配篇/章/节
-    # 篇：整行以“第X篇”开头，后面最多10个字的副标题，且不包含常见非标题词汇
     part_pattern = re.compile(
         r'^第[一二三四五六七八九十\d]+篇(?:\s+[^\n]{0,10})?\s*$'
     )
-    # 章：匹配行中出现的“第X章”，允许之前有正文（会被分离）
     chapter_split_pattern = re.compile(
         r'(.*?)(第[一二三四五六七八九十\d]+章(?:[^\n]{0,30})?)(.*)'
     )
-    # 节：匹配“第X节”，仅当已进入章时有效
     section_pattern = re.compile(
         r'^第[一二三四五六七八九十\d]+节(?:[^\n]{0,30})?\s*$'
     )
@@ -121,14 +158,13 @@ def extract_chapter_texts(pdf_path: str,
         if re.fullmatch(r'[-—\d\s]{2,}', stripped):
             continue
 
-        # 跳过明显是页眉/页脚的短行（如单独的数字、缩略名）
+        # 跳过明显是页眉/页脚的短行
         if len(stripped) < 5 and not re.search(r'第[一二三四五六七八九十\d]+[章节篇]', stripped):
             continue
 
-        # 1. 先检查是否为篇标题（严格行首匹配）
+        # 1. 先检查是否为篇标题
         if part_pattern.match(stripped):
             title = stripped
-            # 跨行合并副标题（如果下一行很短且不是章节标题）
             if i + 1 < len(lines):
                 next_line = lines[i + 1].strip()
                 if next_line and len(next_line) < 30 and not chapter_split_pattern.search(next_line) and not section_pattern.match(next_line):
@@ -136,10 +172,9 @@ def extract_chapter_texts(pdf_path: str,
             set_part(title)
             continue
 
-        # 2. 检查是否包含章标题（允许行中任意位置）
+        # 2. 检查是否包含章标题
         chap_match = chapter_split_pattern.search(stripped)
         if chap_match:
-            # 章标题之前的文字当作上一章的正文
             before = chap_match.group(1).strip()
             title = chap_match.group(2).strip()
             after = chap_match.group(3).strip()
@@ -147,7 +182,6 @@ def extract_chapter_texts(pdf_path: str,
             if before and in_chapter:
                 content_buffer.append(before)
 
-            # 跨行合并章标题（如果标题很短且下一行明显是副标题）
             if len(title) < 15 and i + 1 < len(lines):
                 next_line = lines[i + 1].strip()
                 if next_line and not chapter_split_pattern.search(next_line) and not part_pattern.match(next_line) and len(next_line) < 30:
@@ -155,12 +189,11 @@ def extract_chapter_texts(pdf_path: str,
 
             set_chapter(title)
 
-            # 如果章标题后面还有文字，作为本章内容第一行
             if after:
                 content_buffer.append(after)
             continue
 
-        # 3. 检查节标题（必须已进入章，且行首匹配）
+        # 3. 检查节标题
         if in_chapter and section_pattern.match(stripped):
             title = stripped
             if len(title) < 15 and i + 1 < len(lines):
@@ -176,7 +209,7 @@ def extract_chapter_texts(pdf_path: str,
         if in_chapter:
             content_buffer.append(stripped)
 
-    save_chapter()  # 保存最后一章
+    save_chapter()
     return chapters
 
 
@@ -195,15 +228,9 @@ def generate_summary(chapter_title: str, chapter_text: str) -> str:
 
 
 # ================= 存入 Chroma =================
-def save_summaries_to_chroma(summaries: dict, book_name: str):
-    store = Chroma(
-        persist_directory=CHROMA_PERSIST_DIR,
-        embedding_function=embeddings,
-        collection_name=COLLECTION_NAME,
-    )
+def save_summaries_to_chroma(summaries: dict, book_name: str, store: Chroma):
     texts, metadatas, ids = [], [], []
     for i, (full_key, summary) in enumerate(summaries.items()):
-        # 从 full_key 中解析篇和章（格式：书名_篇_章 或 书名_章）
         parts = full_key.replace(book_name + "_", "", 1).split('_')
         part = ""
         chapter = ""
@@ -231,20 +258,36 @@ def save_summaries_to_chroma(summaries: dict, book_name: str):
 
 # ================= 主流程 =================
 if __name__ == "__main__":
-    print(f"📖 正在处理：《{BOOK_NAME}》")
-    chapter_texts = extract_chapter_texts(
-        PDF_PATH,
-        book_name=BOOK_NAME,
-        start_page=START_PAGE
-    )
-    print(f"📚 检测到 {len(chapter_texts)} 个章节（含篇）。")
+    overall_success = True
+    for book in BOOKS:
+        pdf_path = book["pdf_path"]
+        book_name = book["book_name"]
+        start_page = book.get("start_page", 1)
 
-    summaries = {}
-    for key, text in chapter_texts.items():
-        print(f"⏳ 正在生成摘要：{key}")
-        summary = generate_summary(key, text)
-        summaries[key] = summary
+        print(f"\n📖 正在处理：《{book_name}》")
+        try:
+            chapter_texts = extract_chapter_texts(
+                pdf_path,
+                book_name=book_name,
+                start_page=start_page
+            )
+            print(f"📚 检测到 {len(chapter_texts)} 个章节（含篇）。")
 
-    print("💾 正在存入向量库...")
-    save_summaries_to_chroma(summaries, BOOK_NAME)
-    print("🎉 完成！")
+            summaries = {}
+            for key, text in chapter_texts.items():
+                print(f"⏳ 正在生成摘要：{key}")
+                summary = generate_summary(key, text)
+                summaries[key] = summary
+
+            print("💾 正在存入向量库...")
+            save_summaries_to_chroma(summaries, book_name, summary_store)
+            print(f"🎉 《{book_name}》处理完成！")
+
+        except Exception as e:
+            print(f"❌ 《{book_name}》处理失败：{str(e)}")
+            overall_success = False
+
+    if overall_success:
+        print("\n🎊 所有教材摘要生成完毕，数据已全部存入向量库。")
+    else:
+        print("\n⚠️ 部分教材处理失败，请检查错误信息并重试。")
