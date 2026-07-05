@@ -2,6 +2,9 @@
 venv/
 .venv/
 
+# BGE-Reranker 模型文件（3GB+，不上传 git）
+bge_reranker_cache/
+
 # 向量数据库持久化数据
 chroma_db/
 
@@ -25,3 +28,9 @@ __pycache__/
 .vscode/
 *.swp
 *.swo
+
+# PDF 源文件（按需保留）
+*.pdf
+
+# Claude 工作文件
+.claude/
