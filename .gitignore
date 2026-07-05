@@ -5,6 +5,10 @@ venv/
 # 向量数据库持久化数据
 chroma_db/
 
+# 对话日志
+chat_logs/
+eval_log.jsonl
+
 # mypy 缓存
 .mypy_cache/
 

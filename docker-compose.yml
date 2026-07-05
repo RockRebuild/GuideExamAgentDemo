@@ -12,13 +12,16 @@ services:
     build: .
     container_name: guide-agent
     ports:
-      - "8501:8501"
+      - "8501:8080"
     env_file:
       - .env
     volumes:
       - ./chroma_db:/app/chroma_db
+      - ./chat_logs:/app/chat_logs
+      - ./eval_log.jsonl:/app/eval_log.jsonl
     depends_on:
       - redis
+      - weather-mcp
     restart: always
     networks:
       - guide-net
@@ -33,6 +36,10 @@ services:
       - "8000:8000"
     networks:
       - guide-net
+    dns:
+      - 114.114.114.114
+      - 8.8.8.8
+    restart: always
 
 networks:
   guide-net:

@@ -55,26 +55,57 @@ def log_evaluation(question: str, answer: str, contexts: list[str],
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def log_feedback(question: str, answer: str, feedback: str, comment: str = ""):
+    """
+    记录用户反馈到 eval_log.jsonl（即使没有做 RAGAS 评估也会记录）。
+    如果最后一条记录没有 feedback 且时间和问题匹配，则更新它；
+    否则追加新记录。
+    """
+    now = datetime.now()
+    record = {
+        "timestamp": now.isoformat(timespec="seconds"),
+        "question": question,
+        "answer": answer,
+        "context_count": 0,
+        "contexts": [],
+        "scores": {},
+        "feedback": feedback,
+        "comment": comment,
+    }
+
+    if os.path.exists(EVAL_LOG_FILE):
+        with open(EVAL_LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        # 尝试更新最近一条匹配且没有 feedback 的记录
+        if lines:
+            last = json.loads(lines[-1])
+            if not last.get("feedback") and last.get("question") == question:
+                last["feedback"] = feedback
+                last["comment"] = comment
+                lines[-1] = json.dumps(last, ensure_ascii=False) + "\n"
+                with open(EVAL_LOG_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+                return
+
+    # 追加新记录
+    with open(EVAL_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def update_last_feedback(feedback: str):
     """
-    更新最近一条记录的 feedback 字段。
-    因为评估和用户反馈通常不是同时发生的。
+    更新最近一条记录的 feedback 字段（兼容旧逻辑）。
     """
     if not os.path.exists(EVAL_LOG_FILE):
         return
-
     lines = []
     with open(EVAL_LOG_FILE, "r", encoding="utf-8") as f:
         lines = f.readlines()
-
     if not lines:
         return
-
-    # 找到最后一条，更新 feedback
     last = json.loads(lines[-1])
     last["feedback"] = feedback
     lines[-1] = json.dumps(last, ensure_ascii=False) + "\n"
-
     with open(EVAL_LOG_FILE, "w", encoding="utf-8") as f:
         f.writelines(lines)
 

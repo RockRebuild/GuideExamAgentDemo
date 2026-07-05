@@ -27,5 +27,5 @@ COPY bge_reranker_cache ./bge_reranker_cache
 # 拷贝应用代码
 COPY . .
 
-EXPOSE 8501
-CMD ["pdm", "run", "streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+EXPOSE 8080
+CMD ["pdm", "run", "uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8080"]

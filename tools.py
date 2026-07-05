@@ -18,7 +18,6 @@ from langchain_core.tools import tool, StructuredTool
 from langchain_core.documents import Document
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import streamlit as st
 
 print("=== tools.py 开始执行 ===", file=sys.stderr, flush=True)
 
@@ -62,8 +61,13 @@ def retrieve_with_rerank(query: str, raw_contexts: List[str]) -> str:
     if not refined:
         return ""
 
-    # 保存到 session_state 供评估使用（可选）
-    st.session_state["last_refined_contexts"] = refined
+    # 保存到 contextvar 供 server 端获取（替代 st.session_state）
+    try:
+        from server.state import request_contexts
+        ctx = request_contexts.get()
+        request_contexts.set(list(set(ctx + refined)))
+    except ImportError:
+        pass  # Streamlit 模式下忽略
 
     # 用分隔符拼接，便于 app.py 拆分
     return CONTEXT_SEPARATOR.join(refined)
@@ -397,42 +401,89 @@ def grade_answer(question_id: Optional[str] = None,
 # ============================================================
 # MCP 工具加载（HTTP 模式）
 # ============================================================
+import pydantic
+
+def _json_schema_to_pydantic(schema: dict, name: str):
+    """将 JSON Schema 转换为 Pydantic BaseModel，用于 StructuredTool 的 args_schema"""
+    if not schema or schema.get("type") != "object":
+        return None
+    fields = {}
+    props = schema.get("properties", {})
+    required = schema.get("required", [])
+    for field_name, field_info in props.items():
+        field_type = str
+        # 映射 JSON Schema type 到 Python type
+        json_type = field_info.get("type", "string")
+        if json_type == "integer":
+            field_type = int
+        elif json_type == "number":
+            field_type = float
+        elif json_type == "boolean":
+            field_type = bool
+        desc = field_info.get("description", "")
+        default = ... if field_name in required else None
+        fields[field_name] = (field_type, pydantic.Field(default, description=desc))
+    if not fields:
+        return None
+    return pydantic.create_model(f"{name}_args", **fields)
+
+
 async def _load_mcp_tools_http_async(url: str) -> List[StructuredTool]:
     tools = []
-    client = httpx.AsyncClient(base_url=url)
-    resp = await client.post("/mcp", json={"method": "tools/list"})
-    data = resp.json()
+    async with httpx.AsyncClient(base_url=url, timeout=10.0) as client:
+        resp = await client.post("/mcp", json={"method": "tools/list"})
+        data = resp.json()
 
-    for tool_def in data.get("tools", []):
-        def make_sync_call(name=tool_def["name"], desc=tool_def.get("description", ""),
-                           input_schema=tool_def.get("inputSchema", {})):
-            def sync_call(**kwargs):
-                async def _call():
-                    async with httpx.AsyncClient(base_url=url) as c:
-                        resp = await c.post("/mcp", json={
-                            "method": "tools/call",
-                            "params": {"name": name, "arguments": kwargs}
-                        })
-                        result = resp.json()
-                        content = result.get("content", [])
-                        if content:
-                            return content[0].get("text", str(result))
-                        return str(result)
-                return asyncio.run(_call())
-            return sync_call
+        for tool_def in data.get("tools", []):
+            tool_name = tool_def["name"]
+            input_schema = tool_def.get("inputSchema", {})
 
-        tools.append(
-            StructuredTool.from_function(
-                func=make_sync_call(),
-                name=tool_def["name"],
-                description=tool_def.get("description", ""),
+            def make_sync_call(name=tool_def["name"], desc=tool_def.get("description", ""),
+                               input_schema=tool_def.get("inputSchema", {})):
+                def sync_call(**kwargs):
+                    async def _call():
+                        async with httpx.AsyncClient(base_url=url, timeout=10.0) as c:
+                            resp = await c.post("/mcp", json={
+                                "method": "tools/call",
+                                "params": {"name": name, "arguments": kwargs}
+                            })
+                            result = resp.json()
+                            content = result.get("content", [])
+                            if content:
+                                return content[0].get("text", str(result))
+                            return str(result)
+                    return asyncio.run(_call())
+                return sync_call
+
+            # 从 JSON Schema 构建 Pydantic args_schema，让 LLM 能看到参数定义
+            args_model = _json_schema_to_pydantic(input_schema, tool_name)
+
+            tools.append(
+                StructuredTool.from_function(
+                    func=make_sync_call(),
+                    name=tool_name,
+                    description=tool_def.get("description", ""),
+                    args_schema=args_model,
+                )
             )
-        )
     return tools
 
 
 def load_mcp_tools_http(url: str) -> List[StructuredTool]:
-    return asyncio.run(_load_mcp_tools_http_async(url))
+    """从 HTTP MCP Server 加载工具列表。
+    兼容两种场景：asyncio 事件循环内部（FastAPI）和外部（Streamlit/脚本）。
+    """
+    import concurrent.futures
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 不在 asyncio 上下文中 — 直接用 asyncio.run()
+        return asyncio.run(_load_mcp_tools_http_async(url))
+    else:
+        # 在 asyncio 上下文中（如 FastAPI handler）— 用独立线程避免冲突
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(asyncio.run, _load_mcp_tools_http_async(url))
+            return future.result(timeout=15)
 
 
 # ============================================================

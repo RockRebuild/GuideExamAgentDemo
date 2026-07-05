@@ -13,8 +13,29 @@ from dotenv import load_dotenv
 import asyncio
 
 load_dotenv()  # 自动查找并加载项目根目录下的 .env 文件
-memory = RedisSaver(redis_url="redis://redis:6379")
-memory.setup()
+REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
+
+_memory = None
+_memory_tried = False
+
+
+def get_memory():
+    """
+    懒加载 RedisSaver。
+    - Docker 环境：连接 redis 容器，提供会话记忆
+    - 本地环境：Redis 不可用时返回 None，Agent 无记忆但仍可工作
+    """
+    global _memory, _memory_tried
+    if _memory is None and not _memory_tried:
+        _memory_tried = True
+        try:
+            _memory = RedisSaver(redis_url=REDIS_URL)
+            _memory.setup()
+            print(f"✅ Redis 连接成功 ({REDIS_URL})，会话记忆已启用")
+        except Exception as e:
+            print(f"⚠️ Redis 不可用 ({e})，会话记忆已禁用，但聊天功能正常")
+            _memory = None
+    return _memory
 
 
 # 模型名集中由 DEEPSEEK_MODEL 控制，默认 deepseek-v4-flash（旧 deepseek-chat 2026-07-24 下线）
@@ -37,8 +58,19 @@ def load_system_prompt(filepath="prompts/system_prompt.md"):
 SYSTEM_PROMPT = load_system_prompt()
 
 # 2. 告诉 Agent 它能用什么工具
+# Agent 缓存：key=mode，value=(agent, weather_loaded)
+# 如果天气 MCP 首次加载失败，下次请求会重试，直到成功后再缓存
+_agent_cache = {}
+
 def get_agent_for_mode(mode: str):
-    """根据模式动态创建 Agent，实现工具懒加载"""
+    """根据模式动态创建 Agent，实现工具懒加载（带缓存，天气 MCP 失败时会重试）"""
+    # 如果已缓存且天气工具已成功加载，直接返回
+    if mode in _agent_cache:
+        cached_agent, was_weather_loaded = _agent_cache[mode]
+        if was_weather_loaded:
+            return cached_agent
+        # 天气之前没加载成功，返回缓存的 agent 但这次尝试重新创建（重试 MCP）
+
     tools = []
     final_prompt = SYSTEM_PROMPT
     if mode == "📖 教材知识问答":
@@ -48,17 +80,28 @@ def get_agent_for_mode(mode: str):
         tools = [search_questions]
     elif mode == "📊 阅卷批改":
         tools = [search_textbook, grade_answer]   # ← 确保这里有 grade_answer
-    # 加载自己写的天气 MCP Server（假设运行在 weather-mcp 容器，端口 8000）
-    try:
-        weather_tools = load_mcp_tools_http("http://weather-mcp:8000")
-        tools.extend(weather_tools)
-        print(f"✅ 加载了 {len(weather_tools)} 个 MCP 工具: {[t.name for t in weather_tools]}")
-    except Exception as e:
-        print(f"⚠️ MCP 工具加载失败（weather-mcp 不可用），跳过: {e}")
-    return create_react_agent(llm, tools, checkpointer=memory, prompt=final_prompt)
-
-
-
+    # 加载天气 MCP Server（依次尝试 Docker 容器名 / localhost / 127.0.0.1）
+    weather_loaded = False
+    for host in ["weather-mcp", "localhost", "127.0.0.1"]:
+        url = f"http://{host}:8000"
+        try:
+            weather_tools = load_mcp_tools_http(url)
+            tools.extend(weather_tools)
+            print(f"✅ 从 {url} 加载了 {len(weather_tools)} 个 MCP 工具: {[t.name for t in weather_tools]}")
+            weather_loaded = True
+            break
+        except Exception as e:
+            print(f"⚠️ 连接 {url} 失败: {e}")
+            continue
+    if not weather_loaded:
+        print("⚠️ 天气 MCP 工具不可用（所有主机均连接失败），跳过")
+        # 从 prompt 中移除 get_weather 相关描述，避免 LLM 调用一个不存在的工具
+        import re
+        final_prompt = re.sub(r'- get_weather[^\n]*\n', '', final_prompt)
+        final_prompt = re.sub(r'- 查询天气[^\n]*\n', '', final_prompt)
+    agent = create_react_agent(llm, tools, checkpointer=get_memory(), prompt=final_prompt)
+    _agent_cache[mode] = (agent, weather_loaded)
+    return agent
 
 
 from tenacity import (
