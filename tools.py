@@ -25,7 +25,8 @@ print("=== tools.py 开始执行 ===", file=sys.stderr, flush=True)
 # ============================================================
 # 全局配置
 # ============================================================
-CHROMA_PERSIST_DIR = "./chroma_db"
+CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
+QUESTION_BANK_PATH = os.path.join(os.path.dirname(__file__), "question_bank.json")
 COLLECTION_PARAGRAPH = "guide_child"   # 段落级索引（细粒度，用于语义/混合检索）
 COLLECTION_SUMMARY = "guide_summary"   # 摘要级索引（粗粒度，用于快速定位章节）
 COLLECTION_SENTENCE = "guide_sentence" # 命题/句子级索引（预留，需另行生成）
@@ -332,7 +333,7 @@ def rewritten_search(original_query: str, k: int = 12) -> str:
 def search_questions(chapter: str, qtype: Optional[str] = "全部", count: int = 5) -> str:
     """从题库中按章节和题型检索题目。"""
     try:
-        with open("question_bank.json", "r", encoding="utf-8") as f:
+        with open(QUESTION_BANK_PATH, "r", encoding="utf-8") as f:
             questions = json.load(f)
     except FileNotFoundError:
         return "题库文件未找到，请联系管理员。"
@@ -360,7 +361,7 @@ def grade_answer(question_id: Optional[str] = None,
                  student_answer: str = "") -> str:
     """批改学员的答案。"""
     try:
-        with open("question_bank.json", "r", encoding="utf-8") as f:
+        with open(QUESTION_BANK_PATH, "r", encoding="utf-8") as f:
             questions = json.load(f)
     except FileNotFoundError:
         return "题库文件未找到。"
@@ -368,7 +369,10 @@ def grade_answer(question_id: Optional[str] = None,
     if question_id:
         question = next((q for q in questions if q["id"] == question_id), None)
     elif chapter and qtype and index > 0:
-        filtered = [q for q in questions if q["subject"] == subject and chapter in q["chapter"] and q["type"] == qtype]
+        if subject:
+            filtered = [q for q in questions if q["subject"] == subject and chapter in q["chapter"] and q["type"] == qtype]
+        else:
+            filtered = [q for q in questions if chapter in q["chapter"] and q["type"] == qtype]
         question = filtered[index - 1] if 1 <= index <= len(filtered) else None
         if question:
             question_id = question["id"]

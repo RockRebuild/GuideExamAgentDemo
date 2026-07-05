@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import math
 from datetime import datetime
 from typing import Optional
 from difflib import SequenceMatcher
@@ -61,6 +62,25 @@ langfuse = Langfuse(
 
 warnings.filterwarnings("ignore", message=".*missing ScriptRunContext.*")
 warnings.filterwarnings("ignore", message=".*NoSessionContext.*")
+
+# ── 题库加载（带缓存）────────────────────────────────
+@st.cache_data
+def load_question_bank() -> list[dict]:
+    """加载题库 JSON，Streamlit 缓存避免每次刷新都读文件"""
+    bank_path = os.path.join(os.path.dirname(__file__), "question_bank.json")
+    try:
+        with open(bank_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+@st.cache_data
+def get_question_bank_stats(questions: list[dict]) -> dict:
+    """提取题库的科目、章节、题型列表（用于筛选器）"""
+    subjects = sorted(set(q.get("subject", "未知科目") for q in questions))
+    chapters = sorted(set(q.get("chapter", "未知章节") for q in questions))
+    types = sorted(set(q.get("type", "未知题型") for q in questions))
+    return {"subjects": subjects, "chapters": chapters, "types": types}
 
 st.set_page_config(
     page_title="导游考试 AI 助手",
@@ -201,6 +221,7 @@ elif st.session_state.last_mode != mode:
     st.session_state.last_mode = mode
     st.session_state.last_ragas_scores = None
     st.session_state.pending_eval_context = None
+    st.session_state.qb_page = 0  # 重置题库分页
     st.rerun()
 
 with st.sidebar:
@@ -261,6 +282,120 @@ for i, sample in enumerate(sample_questions.get(mode, [])):
             st.session_state.current_prompt = sample
             st.rerun()
 st.markdown("---")
+
+# ── 阅卷批改模式：题库浏览器 ────────────────────────────
+if mode == "📊 阅卷批改":
+    questions = load_question_bank()
+    stats = get_question_bank_stats(questions)
+
+    if questions:
+        with st.expander("📚 题库浏览（点击展开）", expanded=False):
+            # 筛选器
+            filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([1.2, 1.5, 0.8, 1])
+            with filter_col1:
+                selected_subject = st.selectbox(
+                    "科目", ["全部"] + stats["subjects"],
+                    key="qb_subject"
+                )
+            with filter_col2:
+                # 章节能选的随科目联动
+                if selected_subject != "全部":
+                    available_chapters = sorted(set(
+                        q["chapter"] for q in questions
+                        if q.get("subject") == selected_subject
+                    ))
+                else:
+                    available_chapters = stats["chapters"]
+                selected_chapter = st.selectbox(
+                    "章节", ["全部"] + available_chapters,
+                    key="qb_chapter"
+                )
+            with filter_col3:
+                selected_type = st.selectbox(
+                    "题型", ["全部"] + stats["types"],
+                    key="qb_type"
+                )
+            with filter_col4:
+                per_page = st.selectbox("每页", [10, 20, 50], key="qb_per_page", index=0)
+
+            # 关键词搜索
+            keyword = st.text_input("🔍 搜索题目关键词", key="qb_keyword",
+                                    placeholder="输入关键词筛选题目...")
+
+            # 筛选逻辑
+            filtered = questions
+            if selected_subject != "全部":
+                filtered = [q for q in filtered if q.get("subject") == selected_subject]
+            if selected_chapter != "全部":
+                filtered = [q for q in filtered if q.get("chapter") == selected_chapter]
+            if selected_type != "全部":
+                filtered = [q for q in filtered if q.get("type") == selected_type]
+            if keyword.strip():
+                kw = keyword.strip()
+                filtered = [q for q in filtered if
+                            kw in q.get("question", "") or
+                            kw in q.get("chapter", "") or
+                            any(kw in opt for opt in q.get("options", []))]
+
+            total_filtered = len(filtered)
+
+            # 分页
+            if "qb_page" not in st.session_state:
+                st.session_state.qb_page = 0
+
+            total_pages = max(1, math.ceil(total_filtered / per_page))
+            if st.session_state.qb_page >= total_pages:
+                st.session_state.qb_page = 0
+
+            page_start = st.session_state.qb_page * per_page
+            page_end = min(page_start + per_page, total_filtered)
+            page_data = filtered[page_start:page_end]
+
+            # 分页导航
+            nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+            with nav_col1:
+                if st.button("⬅ 上一页", disabled=(st.session_state.qb_page == 0),
+                             key="qb_prev", use_container_width=True):
+                    st.session_state.qb_page -= 1
+                    st.rerun()
+            with nav_col2:
+                st.caption(f"共 {total_filtered} 题 | 第 {st.session_state.qb_page + 1}/{total_pages} 页")
+            with nav_col3:
+                if st.button("下一页 ➡", disabled=(st.session_state.qb_page >= total_pages - 1),
+                             key="qb_next", use_container_width=True):
+                    st.session_state.qb_page += 1
+                    st.rerun()
+
+            st.divider()
+
+            # 题目列表
+            if not page_data:
+                st.info("没有匹配的题目，请调整筛选条件。")
+            else:
+                # 题型着色
+                TYPE_COLORS = {"单选": "blue", "多选": "orange", "判断": "green"}
+
+                for idx, q in enumerate(page_data):
+                    qtype = q.get("type", "")
+                    color = TYPE_COLORS.get(qtype, "gray")
+                    q_num = page_start + idx + 1
+
+                    with st.container(border=True):
+                        st.caption(
+                            f"**#{q_num}** · :{color}[{qtype}] · "
+                            f"{q.get('subject', '')} · {q.get('chapter', '')}"
+                        )
+
+                        # 题干
+                        st.markdown(q.get('question', ''))
+
+                        # 选项
+                        opts = q.get("options", [])
+                        if opts:
+                            opt_text = "　".join(opts)
+                            st.markdown(opt_text)
+    else:
+        st.warning("题库文件未找到，请检查 question_bank.json 是否存在。")
 
 # ── 聊天输入处理 ────────────────────────────────────
 if prompt := st.chat_input("请输入你的问题，或点击上方的示例问题..."):

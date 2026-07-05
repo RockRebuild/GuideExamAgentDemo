@@ -2,7 +2,6 @@ import os
 import sys
 
 import redis
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
 from langfuse._client.observe import observe
@@ -50,21 +49,17 @@ def get_agent_for_mode(mode: str):
     elif mode == "📊 阅卷批改":
         tools = [search_textbook, grade_answer]   # ← 确保这里有 grade_answer
     # 加载自己写的天气 MCP Server（假设运行在 weather-mcp 容器，端口 8000）
-    weather_tools = load_mcp_tools_http("http://weather-mcp:8000")
-    tools.extend(weather_tools)
-    print(f"✅ 加载了 {len(weather_tools)} 个 MCP 工具: {[t.name for t in weather_tools]}")
+    try:
+        weather_tools = load_mcp_tools_http("http://weather-mcp:8000")
+        tools.extend(weather_tools)
+        print(f"✅ 加载了 {len(weather_tools)} 个 MCP 工具: {[t.name for t in weather_tools]}")
+    except Exception as e:
+        print(f"⚠️ MCP 工具加载失败（weather-mcp 不可用），跳过: {e}")
     return create_react_agent(llm, tools, checkpointer=memory, prompt=final_prompt)
 
 
 
 
-
-prompt_template = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_PROMPT),
-    ("placeholder", "{messages}"),
-])
-
-# agent = create_react_agent(llm, tools, checkpointer=memory, prompt=prompt_template)
 
 from tenacity import (
     retry, stop_after_attempt, wait_exponential,

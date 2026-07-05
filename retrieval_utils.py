@@ -12,11 +12,22 @@ sentence_splitter = RecursiveCharacterTextSplitter(
 )
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "bge_reranker_cache", "BAAI", "bge-reranker-base")
-_tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-_model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
-_model.eval()
+_tokenizer = None
+_model = None
+
+
+def _ensure_model_loaded():
+    """懒加载 BGE-Reranker 模型，避免模块导入时因模型文件缺失而崩溃"""
+    global _tokenizer, _model
+    if _tokenizer is None:
+        _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    if _model is None:
+        _model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+        _model.eval()
+
 
 def compute_scores_batch(query: str, passages: list[str]) -> list[float]:
+    _ensure_model_loaded()
     inputs = _tokenizer([[query, p] for p in passages], padding=True, truncation=True, return_tensors="pt")
     with torch.no_grad():
         logits = _model(**inputs).logits
