@@ -168,11 +168,101 @@ def detect_and_record(tool_name: str, tool_content: str) -> Optional[dict]:
     )
 
 
+def detect_from_agent_text(agent_response: str) -> Optional[list[dict]]:
+    """Fallback：从 LLM 的文本回复中检测错题（当 LLM 没调 grade_answer 工具时）。
+
+    智能出卷模式下，LLM 可能直接在文本中批改而不调用工具。
+    这里检测 "❌ 回答错误" 并尝试提取题目信息。
+    """
+    if "❌ 回答错误" not in agent_response:
+        return None
+
+    # 按 "❌ 回答错误" 拆分，可能有多道错题
+    parts = agent_response.split("❌ 回答错误")
+    if len(parts) < 2:
+        return None
+
+    results = []
+    qb = _load_question_bank()
+
+    for part in parts[1:]:  # 跳过第一个（"❌ 回答错误" 之前的内容）
+        # 提取题目：优先找 "题目：" 行，否则用文本中间最长的句子
+        question = _extract_line(part, "题目：")
+        if not question:
+            question = _extract_llm_question(part)
+
+        # 提取答案
+        user_answer = _extract_line(part, "你的答案：")
+        if not user_answer:
+            user_answer = _extract_llm_user_answer(part)
+        correct_answer = _extract_line(part, "正确答案：")
+        if not correct_answer:
+            correct_answer = _extract_llm_correct_answer(part)
+        explanation = _extract_line(part, "解析：")
+
+        if not question:
+            continue
+
+        # 查题库补全科目章节
+        matched = _find_in_bank(qb, question)
+
+        result = record_wrong(
+            question_id=matched.get("id", _make_id(question)),
+            question=question,
+            user_answer=user_answer or "",
+            correct_answer=correct_answer or "",
+            subject=matched.get("subject", ""),
+            chapter=matched.get("chapter", ""),
+            qtype=matched.get("type", ""),
+            explanation=explanation or "",
+        )
+        if result:
+            results.append(result)
+
+    return results if results else None
+
+
+def _extract_llm_question(text: str) -> str:
+    """从 LLM 自由格式回复中提取题干。"""
+    import re
+    # 去掉 markdown 标记
+    clean = re.sub(r'\*+|#+', '', text)
+    # 找 "X题：" 或 "X题." 后面的内容
+    m = re.search(r'(?:第[一二三四五六七八九十\d]+题|题目)[：:]\s*(.+?)(?:\n|你的|你选|正确|答案|解析)', clean)
+    if m:
+        return m.group(1).strip()
+    # 兜底：取第一句超过15字的句子
+    for line in clean.split('\n'):
+        line = line.strip()
+        if len(line) > 15 and '答案' not in line and '正确' not in line and '解析' not in line:
+            return line
+    return ""
+
+
+def _extract_llm_user_answer(text: str) -> str:
+    """从 LLM 自由格式回复中提取学员答案。"""
+    import re
+    m = re.search(r'(?:你选的答案是|你的答案[：:])\s*(.+?)(?:\n|。|$)', text)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _extract_llm_correct_answer(text: str) -> str:
+    """从 LLM 自由格式回复中提取正确答案。"""
+    import re
+    m = re.search(r'(?:正确答案应为|正确答案[：:])\s*(.+?)(?:\n|。|（|$)', text)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
 def _extract_line(text: str, prefix: str) -> str:
     """从文本中提取以 prefix 开头的那一行内容。"""
     for line in text.split("\n"):
-        if line.startswith(prefix):
-            return line[len(prefix):].strip()
+        stripped = line.strip().lstrip('*').strip()
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].strip()
     return ""
 
 

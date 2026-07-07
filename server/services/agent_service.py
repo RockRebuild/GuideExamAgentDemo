@@ -189,6 +189,15 @@ async def stream_chat(mode: str, prompt: str):
     # Dedupe contexts
     contexts = deduplicate_contexts(contexts)
 
+    # Fallback：如果 LLM 没有调用 grade_answer 工具但回复中包含了批改结果，
+    # 从 full_answer 中检测错题（智能出卷模式下 LLM 可能直接文本批改）
+    if not any(r["name"] == "grade_answer" for r in tool_records) and "❌ 回答错误" in full_answer:
+        try:
+            from wrong_book import detect_from_agent_text
+            detect_from_agent_text(full_answer)
+        except Exception:
+            pass
+
     # Compute token usage
     from llm_service import LLMService
     input_tok, output_tok = LLMService.extract_token_usage_from_stream(chunks)

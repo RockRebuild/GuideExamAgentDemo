@@ -502,6 +502,14 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
         input_tok, output_tok = llm_service.extract_token_usage_from_stream(chunks)
         llm_service._record_usage(input_tok, output_tok)
 
+        # Fallback：从 LLM 文本回复中检测错题（智能出卷模式下可能没调 grade_answer 工具）
+        if not any("grade_answer" in r for r in tool_records) and "❌ 回答错误" in final_answer:
+            try:
+                from wrong_book import detect_from_agent_text
+                detect_from_agent_text(final_answer)
+            except Exception:
+                pass
+
         # ── 工具调用展示（终极完美版）──
         with tool_expander:
             if tool_records:

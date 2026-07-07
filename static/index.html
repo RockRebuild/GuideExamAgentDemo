@@ -419,7 +419,7 @@ details .inner { padding-left: 0.3rem; }
     </div>
     <div v-else class="sidebar-subtitle" style="margin-top:0.2rem;">暂无反馈数据</div>
     <div v-if="evalCount > 0" class="sidebar-subtitle" style="margin-top:0.3rem;">📝 已记录 {{ evalCount }} 条评估日志</div>
-    <div v-if="wrongCount > 0" class="sidebar-subtitle" style="margin-top:0.3rem;">📒 错题本：{{ wrongCount }} 道</div>
+    <div v-if="wrongCount > 0 && currentMode === '📝 智能出卷'" class="sidebar-subtitle" style="margin-top:0.3rem;">📒 错题本：{{ wrongCount }} 道</div>
 
     <hr class="sidebar-divider">
 
@@ -459,7 +459,7 @@ details .inner { padding-left: 0.3rem; }
   <main class="main" ref="mainScroll">
     <h1>
       {{ currentMode }}
-      <button class="wb-btn" @click="showWrongBook=true; loadWrongBook()">
+      <button v-if="currentMode === '📝 智能出卷'" class="wb-btn" @click="showWrongBook=true; loadWrongBook()">
         📒 错题本<span v-if="wrongCount>0" class="badge">{{ wrongCount }}</span>
       </button>
     </h1>
