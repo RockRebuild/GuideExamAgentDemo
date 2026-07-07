@@ -13,9 +13,9 @@ TEST_CASES = [
     ("导游证的种类有哪些？", "search_textbook"),
 
     # 出卷请求（期望调用 search_questions）
-    ("帮我出两道导游业务第三章的单选题目", "search_questions"),
-    ("给我找三道关于旅游法的多选题", "search_questions"),
-    ("出五道判断题，范围是政策法规", "search_questions"),
+    ("导游业务 团队导游服务规范 出3道单选题", "search_questions"),
+    ("合同法律制度出5道多选题", "search_questions"),
+    ("中国饮食文化 出4道判断题", "search_questions"),
     "",
     "帮我批改题目 科目四的第十章多选第三题，我选 A",
     # 批改请求（期望调用 grade_answer）
