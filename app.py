@@ -83,7 +83,7 @@ def get_question_bank_stats(questions: list[dict]) -> dict:
     return {"subjects": subjects, "chapters": chapters, "types": types}
 
 st.set_page_config(
-    page_title="基于导游考试Agent的RAG项目实践",
+    page_title="AI导游考试Agent-RAG智能问答系统",
     page_icon="📝",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -238,7 +238,7 @@ elif st.session_state.last_mode != mode:
     st.rerun()
 
 with st.sidebar:
-    st.title("📝 基于导游考试Agent的RAG项目实践")
+    st.title("📝 AI导游考试Agent-RAG智能问答系统")
     st.markdown("---")
     st.caption("技术栈：Python | LangChain | LangGraph | ChromaDB | Streamlit")
     st.caption("AI 模型：DeepSeek / 阿里云百炼")

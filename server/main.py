@@ -72,7 +72,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="基于导游考试Agent的RAG项目实践",
+    title="AI导游考试Agent-RAG智能问答系统",
     description="导游考试智能助手后端服务",
     version="2.0.0",
     lifespan=lifespan,
