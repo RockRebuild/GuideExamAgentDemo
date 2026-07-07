@@ -9,7 +9,7 @@ HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 if [ ! -f "$MODEL_DIR/tokenizer.json" ] || [ ! -f "$MODEL_DIR/config.json" ]; then
     echo "⏳ BGE-Reranker 模型未找到，正在从 $HF_ENDPOINT 下载..."
     export HF_ENDPOINT
-    .venv/bin/python -c "
+    pdm run python -c "
 import os
 os.environ['HF_ENDPOINT'] = '$HF_ENDPOINT'
 from huggingface_hub import snapshot_download
