@@ -117,19 +117,53 @@ RETRYABLE = (RateLimitError, APIConnectionError, InternalServerError, APITimeout
 
 @observe()
 def stream_agent_with_retry(agent, messages, config=None):
-    """带重试的流式调用生成器"""
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(RETRYABLE),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
-    )
-    def _stream():
-        # 每次重试都重新调用 agent.stream() 获取全新生成器
-        for chunk in agent.stream({"messages": messages}, config=config):
-            yield chunk
+    """带重试的流式调用生成器。
 
-    yield from _stream()
+    如果检测到 checkpoint 中有孤儿 tool_calls（上次请求中断），
+    自动切换到新 thread_id 重试，避免 LangGraph 状态校验失败。
+    """
+    import time
+    import copy
+    last_error = None
+    orphan_fixed = False  # 只允许一次孤儿修复，防止死循环
+    attempt = 0
+
+    while attempt < 3:
+        try:
+            for chunk in agent.stream({"messages": messages}, config=config):
+                yield chunk
+            return  # 成功
+        except RETRYABLE as e:
+            last_error = e
+            attempt += 1
+            logger.warning(f"Agent stream 失败 (attempt {attempt}/3): {e}")
+            if attempt < 3:
+                time.sleep(min(2 ** attempt, 10))
+        except Exception as e:
+            err_msg = str(e)
+            # 孤儿 tool_calls：LangGraph checkpoint 中有未完成的工具调用
+            if "tool_calls" in err_msg and "ToolMessage" in err_msg:
+                if orphan_fixed:
+                    raise  # 修复一次后仍失败，不再重试
+                orphan_fixed = True
+                logger.warning(
+                    f"检测到孤儿 tool_calls，切换新会话重试: {err_msg[:200]}"
+                )
+                # 创建新 thread_id 绕过损坏的 checkpoint
+                old_tid = config.get("configurable", {}).get("thread_id", "default")
+                new_tid = f"{old_tid}_{int(time.time())}"
+                config = copy.deepcopy(config) if config else {}
+                config.setdefault("configurable", {})["thread_id"] = new_tid
+                # 补上 SystemPrompt（孤儿状态下的新会话需要完整上下文）
+                from langchain_core.messages import SystemMessage
+                if isinstance(messages, list) and not any(
+                    isinstance(m, SystemMessage) for m in messages
+                ):
+                    messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
+                # 孤儿修复不消耗重试次数
+                logger.info(f"已切换到新 thread_id: {new_tid}")
+                continue
+            raise
 
 
 

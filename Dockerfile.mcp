@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+
+WORKDIR /app
+
+# 只安装 MCP 服务实际需要的 4 个轻量依赖
+RUN pip install fastapi uvicorn httpx starlette \
+    -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+
+COPY weather_server.py ./
+
+EXPOSE 8000
+CMD ["python", "weather_server.py"]

@@ -10,7 +10,7 @@ import redis
 import streamlit as st
 import warnings
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 
 from langfuse import Langfuse
 
@@ -106,6 +106,19 @@ def sanitize_input(user_input: str) -> tuple[str, Optional[str]]:
             return "", f"检测到不当关键词 '{keyword}'，请求被拒绝。如有疑问请联系管理员。"
     return user_input, None
 
+def _app_has_orphaned_tool_calls(messages: list) -> bool:
+    """Check for AIMessages with tool_calls that lack a matching ToolMessage."""
+    if not messages:
+        return False
+    answered_ids = {msg.tool_call_id for msg in messages
+                    if isinstance(msg, ToolMessage) and msg.tool_call_id}
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc.get("id") not in answered_ids:
+                    return True
+    return False
+
 def save_feedback(question, answer, feedback_type, comment=""):
     feedback_data = json.dumps({
         "user_input": question,
@@ -184,7 +197,7 @@ def _eval_progress_dialog():
     msg_id = st.session_state.get("last_msg_id", "")
 
     if st.session_state.pop("_do_eval", False):
-        with st.spinner("⏳ 四项指标评估中（约需 30 秒）..."):
+        with st.spinner("⏳ 四项指标评估中（约需 1 分钟）..."):
             scores = evaluate_current_answer(ctx["prompt"], ctx["answer"], ctx["contexts"])
 
         log_evaluation(question=ctx["prompt"], answer=ctx["answer"],
@@ -431,7 +444,17 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
     except Exception:
         state = None
 
-    if state is None or not state.values.get("messages"):
+    existing_messages = state.values.get("messages", []) if state else []
+
+    # 检测孤儿 tool_calls（上次请求中断导致的状态损坏）
+    if existing_messages and _app_has_orphaned_tool_calls(existing_messages):
+        import time
+        new_thread_id = f"{thread_id}_{int(time.time())}"
+        print(f"⚠️ 检测到孤儿工具调用，创建新会话: {thread_id} → {new_thread_id}", flush=True)
+        thread_id = new_thread_id
+        config = {"configurable": {"thread_id": thread_id}}
+        messages = [SystemMessage(content=SYSTEM_PROMPT), ("user", prompt)]
+    elif not existing_messages:
         messages = [SystemMessage(content=SYSTEM_PROMPT), ("user", prompt)]
     else:
         messages = [("user", prompt)]

@@ -12,17 +12,30 @@ sentence_splitter = RecursiveCharacterTextSplitter(
 )
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "bge_reranker_cache", "BAAI", "bge-reranker-base")
+MODEL_ID = "BAAI/bge-reranker-base"  # HuggingFace fallback
 _tokenizer = None
 _model = None
 
 
 def _ensure_model_loaded():
-    """懒加载 BGE-Reranker 模型，避免模块导入时因模型文件缺失而崩溃"""
+    """懒加载 BGE-Reranker 模型。
+
+    优先从本地 MODEL_PATH 加载，如果本地缓存文件不完整（例如缺少 tokenizer 文件），
+    自动从 HuggingFace Hub 下载缺失的文件（通过 HF_ENDPOINT 环境变量，默认 hf-mirror.com）。
+    """
     global _tokenizer, _model
     if _tokenizer is None:
-        _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+        try:
+            _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+        except (ValueError, OSError, ImportError) as e:
+            print(f"⚠️ 本地 tokenizer 加载失败 ({e})，尝试在线下载...", flush=True)
+            _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     if _model is None:
-        _model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+        try:
+            _model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+        except (ValueError, OSError, ImportError) as e:
+            print(f"⚠️ 本地模型加载失败 ({e})，尝试在线下载...", flush=True)
+            _model = AutoModelForSequenceClassification.from_pretrained(MODEL_ID)
         _model.eval()
 
 

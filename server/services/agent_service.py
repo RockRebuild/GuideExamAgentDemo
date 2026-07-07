@@ -6,7 +6,7 @@ import re
 import os
 from typing import Optional
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 
 from agent import get_agent_for_mode, stream_agent_with_retry, SYSTEM_PROMPT
 from tools import extract_contexts_from_response, CONTEXT_SEPARATOR
@@ -14,6 +14,28 @@ from server.state import request_contexts, request_tool_records
 
 RETRIEVAL_TOOLS = {"search_textbook", "hybrid_search", "multi_search",
                    "rewritten_search", "parent_child_search"}
+
+
+def _has_orphaned_tool_calls(messages: list) -> bool:
+    """Check if any AIMessage has tool_calls without a corresponding ToolMessage.
+
+    This happens when a request is interrupted mid-tool-execution (e.g. user
+    refreshes, connection breaks, or API retry after partial progress).
+    """
+    if not messages:
+        return False
+    # Collect all tool_call_ids that have a matching ToolMessage
+    answered_ids = set()
+    for msg in messages:
+        if isinstance(msg, ToolMessage) and msg.tool_call_id:
+            answered_ids.add(msg.tool_call_id)
+    # Check if any AIMessage has a tool_call not in answered_ids
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc.get("id") not in answered_ids:
+                    return True
+    return False
 
 
 def _normalize_pdf_text(text: str) -> str:
@@ -66,15 +88,27 @@ async def stream_chat(mode: str, prompt: str):
     """
     thread_id = THREAD_IDS.get(mode, "guide_exam_default")
     agent = get_agent_for_mode(mode)
-    config = {"configurable": {"thread_id": thread_id}}
 
     # Check existing state for memory continuity
+    config = {"configurable": {"thread_id": thread_id}}
     try:
         state = agent.get_state(config)
     except Exception:
         state = None
 
-    if state is None or not state.values.get("messages"):
+    existing_messages = state.values.get("messages", []) if state else []
+
+    if existing_messages and _has_orphaned_tool_calls(existing_messages):
+        # 孤儿 tool_calls：上次请求中断导致 checkpoint 中有未完成的工具调用。
+        # LangGraph 会用 add_messages reducer 合并输入 → 历史消息 + 新消息，
+        # 孤儿 AIMessage 仍在状态中 → 校验失败。只能换 thread_id 绕过。
+        import time
+        new_thread_id = f"{thread_id}_{int(time.time())}"
+        print(f"⚠️ 检测到孤儿工具调用，创建新会话: {thread_id} → {new_thread_id}", flush=True)
+        thread_id = new_thread_id
+        config = {"configurable": {"thread_id": thread_id}}
+        messages = [SystemMessage(content=SYSTEM_PROMPT), ("user", prompt)]
+    elif not existing_messages:
         messages = [SystemMessage(content=SYSTEM_PROMPT), ("user", prompt)]
     else:
         messages = [("user", prompt)]
