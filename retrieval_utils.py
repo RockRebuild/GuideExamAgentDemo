@@ -2,7 +2,14 @@ import os
 import re
 from difflib import SequenceMatcher
 
+# ECS 小内存实例上 torch 默认会用所有 CPU 核心 + 大 batch 导致 OOM
+# 这些环境变量必须在 import torch 之前设置
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+
 import torch
+torch.set_num_threads(2)
+
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -39,12 +46,20 @@ def _ensure_model_loaded():
         _model.eval()
 
 
-def compute_scores_batch(query: str, passages: list[str]) -> list[float]:
+def compute_scores_batch(query: str, passages: list[str], sub_batch: int = 6) -> list[float]:
+    """BGE-Reranker 打分，按 sub_batch 分批处理以防小内存实例 OOM。"""
     _ensure_model_loaded()
-    inputs = _tokenizer([[query, p] for p in passages], padding=True, truncation=True, return_tensors="pt")
-    with torch.no_grad():
-        logits = _model(**inputs).logits
-    return torch.sigmoid(logits).flatten().tolist()
+    all_scores = []
+    for start in range(0, len(passages), sub_batch):
+        batch = passages[start:start + sub_batch]
+        inputs = _tokenizer(
+            [[query, p] for p in batch],
+            padding=True, truncation=True, max_length=512, return_tensors="pt"
+        )
+        with torch.no_grad():
+            logits = _model(**inputs).logits
+        all_scores.extend(torch.sigmoid(logits).flatten().tolist())
+    return all_scores
 
 def rerank_contexts(query: str, contexts: list[str], top_k: int = 5) -> list[str]:
     if not contexts:
