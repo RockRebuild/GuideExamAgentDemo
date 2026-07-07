@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
 
     # Pre-load BM25 index and BGE reranker (warm-up)
     try:
-        from tools import _init_bm25, get_embeddings
+        from server.core.tools import _init_bm25, get_embeddings
         _init_bm25()
         get_embeddings()
     except Exception as e:

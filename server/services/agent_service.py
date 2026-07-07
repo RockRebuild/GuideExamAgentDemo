@@ -8,8 +8,8 @@ from typing import Optional
 
 from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 
-from agent import get_agent_for_mode, stream_agent_with_retry, SYSTEM_PROMPT
-from tools import extract_contexts_from_response, CONTEXT_SEPARATOR
+from server.core.agent import get_agent_for_mode, stream_agent_with_retry, SYSTEM_PROMPT
+from server.core.tools import extract_contexts_from_response, CONTEXT_SEPARATOR
 from server.state import request_contexts, request_tool_records
 
 RETRIEVAL_TOOLS = {"search_textbook", "hybrid_search", "multi_search",
@@ -171,7 +171,7 @@ async def stream_chat(mode: str, prompt: str):
                 # 自动记录错题（grade_answer 返回错误答案时）
                 if tool_msg.name == "grade_answer":
                     try:
-                        from wrong_book import detect_and_record
+                        from server.core.wrong_book import detect_and_record
                         detect_and_record(tool_msg.name, tool_msg.content or "")
                     except Exception:
                         pass  # 错题记录失败不影响主流程
@@ -193,13 +193,13 @@ async def stream_chat(mode: str, prompt: str):
     # 从 full_answer 中检测错题（智能出卷模式下 LLM 可能直接文本批改）
     if not any(r["name"] == "grade_answer" for r in tool_records) and "❌ 回答错误" in full_answer:
         try:
-            from wrong_book import detect_from_agent_text
+            from server.core.wrong_book import detect_from_agent_text
             detect_from_agent_text(full_answer)
         except Exception:
             pass
 
     # Compute token usage
-    from llm_service import LLMService
+    from server.core.llm_service import LLMService
     input_tok, output_tok = LLMService.extract_token_usage_from_stream(chunks)
 
     # Send done event

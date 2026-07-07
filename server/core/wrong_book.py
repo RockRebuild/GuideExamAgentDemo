@@ -274,7 +274,7 @@ def _make_id(text: str) -> str:
 
 def _load_question_bank() -> list[dict]:
     """加载题库 JSON"""
-    bank_path = os.path.join(os.path.dirname(__file__), "question_bank.json")
+    bank_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "question_bank.json")
     try:
         with open(bank_path, "r", encoding="utf-8") as f:
             return json.load(f)

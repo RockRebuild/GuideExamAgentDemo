@@ -5,7 +5,7 @@ from datetime import date, timedelta
 
 from fastapi import APIRouter, Request
 
-from llm_service import LLMService, PRICES
+from server.core.llm_service import LLMService, PRICES
 
 router = APIRouter(prefix="/api/cost", tags=["cost"])
 
@@ -64,5 +64,5 @@ async def daily_cost(request: Request):
 @router.get("/eval-count")
 async def eval_count():
     """Get evaluation log count."""
-    from eval_logger import count_total
+    from server.core.eval_logger import count_total
     return {"count": count_total()}

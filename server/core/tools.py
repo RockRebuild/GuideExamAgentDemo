@@ -24,8 +24,8 @@ print("=== tools.py 开始执行 ===", file=sys.stderr, flush=True)
 # ============================================================
 # 全局配置
 # ============================================================
-CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
-QUESTION_BANK_PATH = os.path.join(os.path.dirname(__file__), "question_bank.json")
+CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "chroma_db")
+QUESTION_BANK_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "question_bank.json")
 COLLECTION_PARAGRAPH = "guide_child"   # 段落级索引（细粒度，用于语义/混合检索）
 COLLECTION_SUMMARY = "guide_summary"   # 摘要级索引（粗粒度，用于快速定位章节）
 COLLECTION_SENTENCE = "guide_sentence" # 命题/句子级索引（预留，需另行生成）
@@ -50,7 +50,7 @@ def retrieve_with_rerank(query: str, raw_contexts: List[str]) -> str:
     对原始上下文列表执行精排，并以分隔符拼接为字符串返回。
     同时将精排后的列表存入 st.session_state，方便 app.py 直接获取。
     """
-    from retrieval_utils import refine_and_rerank, determine_top_k
+    from server.core.retrieval_utils import refine_and_rerank, determine_top_k
 
     if not raw_contexts:
         return ""

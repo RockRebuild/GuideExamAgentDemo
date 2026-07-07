@@ -18,7 +18,7 @@ sentence_splitter = RecursiveCharacterTextSplitter(
     separators=["\n", "。", "！", "？", "；", " ", ""]
 )
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "bge_reranker_cache", "BAAI", "bge-reranker-base")
+MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "bge_reranker_cache", "BAAI", "bge-reranker-base")
 MODEL_ID = "BAAI/bge-reranker-base"  # HuggingFace fallback
 _tokenizer = None
 _model = None

@@ -8,7 +8,7 @@ import redis
 from fastapi import APIRouter, Request
 
 from server.models.schemas import FeedbackRequest, FeedbackStatsResponse
-from eval_logger import update_last_feedback, log_feedback
+from server.core.eval_logger import update_last_feedback, log_feedback
 
 router = APIRouter(prefix="/api/feedback", tags=["feedback"])
 

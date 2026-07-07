@@ -14,9 +14,9 @@ from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 
 from langfuse import Langfuse
 
-from agent import stream_agent_with_retry, SYSTEM_PROMPT, get_agent_for_mode
-from llm_service import LLMService
-from eval_logger import log_evaluation, update_last_feedback, count_total
+from server.core.agent import stream_agent_with_retry, SYSTEM_PROMPT, get_agent_for_mode
+from server.core.llm_service import LLMService
+from server.core.eval_logger import log_evaluation, update_last_feedback, count_total
 
 from openai import AsyncOpenAI
 from ragas.llms import llm_factory
@@ -482,7 +482,7 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
                 )
 
                 if tool_msg.name in RETRIEVAL_TOOLS:
-                    from tools import extract_contexts_from_response
+                    from server.core.tools import extract_contexts_from_response
                     tool_contexts = extract_contexts_from_response(tool_msg.content or "")
                     if tool_contexts:
                         contexts.extend(tool_contexts)
@@ -490,7 +490,7 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
                 # 自动记录错题
                 if tool_msg.name == "grade_answer":
                     try:
-                        from wrong_book import detect_and_record
+                        from server.core.wrong_book import detect_and_record
                         detect_and_record(tool_msg.name, tool_msg.content or "")
                     except Exception:
                         pass
@@ -505,7 +505,7 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
         # Fallback：从 LLM 文本回复中检测错题（智能出卷模式下可能没调 grade_answer 工具）
         if not any("grade_answer" in r for r in tool_records) and "❌ 回答错误" in final_answer:
             try:
-                from wrong_book import detect_from_agent_text
+                from server.core.wrong_book import detect_from_agent_text
                 detect_from_agent_text(final_answer)
             except Exception:
                 pass

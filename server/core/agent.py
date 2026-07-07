@@ -6,8 +6,8 @@ from langchain_openai import ChatOpenAI
 from langfuse._client.observe import observe
 from langgraph.checkpoint.redis import RedisSaver
 from langgraph.prebuilt import create_react_agent
-from tools import search_questions, search_textbook, grade_answer, hybrid_search, multi_search, rewritten_search, \
-    parent_child_search, load_mcp_tools_http  # 导入你的工具
+from server.core.tools import search_questions, search_textbook, grade_answer, hybrid_search, multi_search, rewritten_search, \
+    parent_child_search, load_mcp_tools_http
 from dotenv import load_dotenv
 import asyncio
 

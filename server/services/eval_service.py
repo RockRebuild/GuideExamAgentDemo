@@ -18,7 +18,7 @@ from ragas.metrics.collections import (
 )
 import os
 
-from eval_logger import log_evaluation
+from server.core.eval_logger import log_evaluation
 
 # ── RAGAS Evaluation Models (same as app.py) ──────────
 

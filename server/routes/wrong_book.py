@@ -2,7 +2,7 @@
 # 错题本 API 路由
 from fastapi import APIRouter
 
-from wrong_book import get_all, get_by_subject, get_stats, delete_wrong, clear_all
+from server.core.wrong_book import get_all, get_by_subject, get_stats, delete_wrong, clear_all
 
 router = APIRouter(prefix="/api/wrong-book", tags=["wrong-book"])
 

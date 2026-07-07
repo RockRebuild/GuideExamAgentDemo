@@ -5,7 +5,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_community.embeddings import DashScopeEmbeddings
 
-from generate_summaries import clean_ad_lines
+from scripts.generate_summaries import clean_ad_lines
 
 embeddings = DashScopeEmbeddings(model="text-embedding-v4")
 
