@@ -22,6 +22,7 @@ services:
       - ./chat_logs:/app/chat_logs
       - ./eval_log.jsonl:/app/eval_log.jsonl
       - ./hf_cache:/root/.cache/huggingface
+      - ./bge_reranker_cache:/app/bge_reranker_cache
     depends_on:
       - redis
       - weather-mcp

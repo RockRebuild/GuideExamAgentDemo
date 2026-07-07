@@ -9,13 +9,14 @@ HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 if [ ! -f "$MODEL_DIR/tokenizer.json" ] || [ ! -f "$MODEL_DIR/config.json" ]; then
     echo "⏳ BGE-Reranker 模型未找到，正在从 $HF_ENDPOINT 下载..."
     export HF_ENDPOINT
-    python -c "
+    .venv/bin/python -c "
 import os
 os.environ['HF_ENDPOINT'] = '$HF_ENDPOINT'
 from huggingface_hub import snapshot_download
 snapshot_download('$MODEL_ID',
     local_dir='$MODEL_DIR',
-    local_dir_use_symlinks=False)
+    local_dir_use_symlinks=False,
+    ignore_patterns=['*.bin', '*.msgpack', '*.h5', 'onnx/*'])
 "
     echo "✅ BGE-Reranker 模型下载完成"
 else
