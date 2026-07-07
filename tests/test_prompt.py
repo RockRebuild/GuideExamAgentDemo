@@ -7,7 +7,7 @@ from agent import agent  # 你的 Agent 实例
 TEST_CASES = [
     # 知识点检索（期望调用 search_textbook）
     ("地陪导游接团前需要准备哪些证件？", "search_textbook"),
-    ("全陪导游的职责是什么？", "search_textbook"),
+    ("查询未来五天的杭州天气", None),  # 应调用 get_weather，不走教材检索
     ("《旅游法》第35条是什么？", "search_textbook"),
     ("全国导游基础知识第二章目录", "search_textbook"),
     ("导游证的种类有哪些？", "search_textbook"),

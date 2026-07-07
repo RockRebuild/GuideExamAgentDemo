@@ -83,7 +83,7 @@ def get_question_bank_stats(questions: list[dict]) -> dict:
     return {"subjects": subjects, "chapters": chapters, "types": types}
 
 st.set_page_config(
-    page_title="导游考试 AI 助手",
+    page_title="基于导游考试Agent的RAG项目实践",
     page_icon="📝",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -238,7 +238,7 @@ elif st.session_state.last_mode != mode:
     st.rerun()
 
 with st.sidebar:
-    st.title("📝 导游考试 AI 助手")
+    st.title("📝 基于导游考试Agent的RAG项目实践")
     st.markdown("---")
     st.caption("技术栈：Python | LangChain | LangGraph | ChromaDB | Streamlit")
     st.caption("AI 模型：DeepSeek / 阿里云百炼")
@@ -264,7 +264,7 @@ with st.sidebar:
 sample_questions = {
     "📖 教材知识问答": [
         "政策与法律法规的第二章主要讲了什么？",
-        "全陪导游的职责是什么？",
+        "查询未来五天的杭州天气",
         "《旅游法》第35条是什么？",
         "导游证的种类有哪些？"
     ],

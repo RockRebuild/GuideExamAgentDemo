@@ -22,3 +22,5 @@ Dockerfile*
 docker-compose*
 .dockerignore
 download_reranker_model.py
+hf_cache/
+download_reranker_model.py

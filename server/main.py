@@ -72,7 +72,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="导游考试 AI 助手 API",
+    title="基于导游考试Agent的RAG项目实践",
     description="导游考试智能助手后端服务",
     version="2.0.0",
     lifespan=lifespan,
@@ -102,7 +102,7 @@ async def list_modes():
                 "name": "📖 教材知识问答",
                 "samples": [
                     "政策与法律法规的第二章主要讲了什么？",
-                    "全陪导游的职责是什么？",
+                    "查询未来五天的杭州天气",
                     "《旅游法》第35条是什么？",
                     "导游证的种类有哪些？"
                 ]

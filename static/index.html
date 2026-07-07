@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>导游考试 AI 助手</title>
+<title>基于导游考试Agent的RAG项目实践</title>
 <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
@@ -391,7 +391,7 @@ details .inner { padding-left: 0.3rem; }
 
   <!-- ==================== SIDEBAR ==================== -->
   <aside class="sidebar">
-    <div class="sidebar-title">📝 导游考试 AI 助手</div>
+    <div class="sidebar-title">📝 基于导游考试Agent的RAG项目实践</div>
     <div class="sidebar-subtitle">Python · FastAPI · LangChain · DeepSeek · ChromaDB</div>
     <div class="sidebar-subtitle">Redis · RAGAS · Langfuse · BGE-Reranker</div>
     <hr class="sidebar-divider">
@@ -693,7 +693,7 @@ const app = createApp({
     const currentMode = ref(modes[0]);
 
     const samples = {
-      '📖 教材知识问答': ['政策与法律法规的第二章主要讲了什么？','全陪导游的职责是什么？','《旅游法》第35条是什么？','导游证的种类有哪些？'],
+      '📖 教材知识问答': ['政策与法律法规的第二章主要讲了什么？','查询未来五天的杭州天气','《旅游法》第35条是什么？','导游证的种类有哪些？'],
       '📝 智能出卷': ['导游业务 团队导游服务规范 出3道单选题','合同法律制度出5道多选题','中国饮食文化 出4道判断题'],
       '📊 阅卷批改': ['请批改题目 科目一的第一章单选第一题，我的答案是 B','帮我批改题目 科目四的第十章多选第三题，我选 A，B'],
     };
@@ -835,7 +835,7 @@ const app = createApp({
         const msg = {
           _id: nextMsgId(), role:'assistant',
           content: answer||'(无回答)',
-          toolRecords, toolsOpen: toolRecords.length>0,
+          toolRecords, toolsOpen: false,
           feedbackState:null, hasContexts: contexts.length>0,
           ragasScores:null, comment:'',
           _contexts: contexts, _question: prompt, _answer: answer, _mode: mode,
