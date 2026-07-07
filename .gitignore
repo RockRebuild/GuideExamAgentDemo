@@ -40,4 +40,4 @@ __pycache__/
 
 # 本地日志
 error.log
-*.log
+*.loghf_cache/

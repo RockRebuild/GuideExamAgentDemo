@@ -487,6 +487,14 @@ if "current_prompt" in st.session_state and st.session_state.current_prompt:
                     if tool_contexts:
                         contexts.extend(tool_contexts)
 
+                # 自动记录错题
+                if tool_msg.name == "grade_answer":
+                    try:
+                        from wrong_book import detect_and_record
+                        detect_and_record(tool_msg.name, tool_msg.content or "")
+                    except Exception:
+                        pass
+
             if "agent" in chunk:
                 final_answer += chunk["agent"]["messages"][0].content
                 answer_placeholder.markdown(final_answer)

@@ -79,7 +79,7 @@ app = FastAPI(
 )
 
 # ── Import routes AFTER app is created to avoid circular imports ──
-from server.routes import chat, feedback, evaluation, question_bank, cost, chat_log
+from server.routes import chat, feedback, evaluation, question_bank, cost, chat_log, wrong_book
 from server.routes.cost import router as cost_router  # has two routes
 
 app.include_router(chat.router)
@@ -88,6 +88,7 @@ app.include_router(evaluation.router)
 app.include_router(question_bank.router)
 app.include_router(cost_router)
 app.include_router(chat_log.router)
+app.include_router(wrong_book.router)
 
 
 # ── Modes endpoint ────────────────────────────────────
