@@ -20,8 +20,10 @@ COPY pyproject.toml pdm.lock ./
 # torch 不在 pyproject.toml 里 → PDM 不装 → 零 CUDA；事后 --target 到 __pypackages__ 即可
 RUN PIP_TRUSTED_HOST=mirrors.aliyun.com pdm install --prod --no-self --without dev \
     && pip install "torch>=2.0" \
+        -i https://mirrors.aliyun.com/pypi/simple/ \
         --target /app/__pypackages__/3.11/lib \
         --extra-index-url https://download.pytorch.org/whl/cpu \
+        --trusted-host mirrors.aliyun.com \
         --trusted-host download.pytorch.org --no-cache-dir \
     && rm -rf /root/.cache/pip /root/.cache/pdm /tmp/*
 
