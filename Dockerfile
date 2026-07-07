@@ -15,13 +15,14 @@ RUN pip install pdm -i https://mirrors.aliyun.com/pypi/simple/ \
 RUN pdm config pypi.url "https://mirrors.aliyun.com/pypi/simple/"
 RUN pdm config python.use_venv false
 
-# 先装 CPU torch（指定版本避免回溯），再 pdm 装其他依赖
-RUN pip install "torch>=2.0" \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
-        --trusted-host download.pytorch.org --no-cache-dir
-
 COPY pyproject.toml pdm.lock ./
+# PDM 用 PEP 582 模式，包都在 __pypackages__/
+# torch 不在 pyproject.toml 里 → PDM 不装 → 零 CUDA；事后 --target 到 __pypackages__ 即可
 RUN PIP_TRUSTED_HOST=mirrors.aliyun.com pdm install --prod --no-self --without dev \
+    && pip install "torch>=2.0" \
+        --target /app/__pypackages__/3.11/lib \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        --trusted-host download.pytorch.org --no-cache-dir \
     && rm -rf /root/.cache/pip /root/.cache/pdm /tmp/*
 
 COPY . .
