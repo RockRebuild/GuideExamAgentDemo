@@ -2,7 +2,6 @@ import os
 import sys
 
 import redis
-from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
 from langfuse._client.observe import observe
 from langgraph.checkpoint.redis import RedisSaver

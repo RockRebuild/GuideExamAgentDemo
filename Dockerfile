@@ -5,30 +5,35 @@ ENV LC_ALL=en_US.UTF-8
 
 WORKDIR /app
 
-# 系统依赖（已移除不需要的 nodejs/npm，节省 ~945MB）
-RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources \
+# apt 用阿里云公网镜像（https 有证书），pypi 同理
+RUN sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 PDM
-RUN pip install pdm -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --no-cache-dir
+# PDM
+RUN pip install pdm -i https://mirrors.aliyun.com/pypi/simple/ \
+    --trusted-host mirrors.aliyun.com --no-cache-dir
 RUN pdm config pypi.url "https://mirrors.aliyun.com/pypi/simple/"
 
-# 拷贝依赖文件
+# 依赖文件
 COPY pyproject.toml pdm.lock ./
 
-# 先装 CPU 版 torch（比 CUDA 版小 ~2GB，BGE-Reranker 推理用 CPU 足够）
-RUN pip install torch --index-url https://download.pytorch.org/whl/cpu --no-cache-dir
-
-# 安装全部依赖（torch 已满足 → 跳过）
-RUN pdm install --prod --no-self \
+# CPU torch + 全部依赖
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu --no-cache-dir \
+    && PIP_TRUSTED_HOST=mirrors.aliyun.com pdm install --prod --no-self --without dev \
     && rm -rf /root/.cache/pip /root/.cache/pdm /tmp/*
 
-# bge_reranker_cache 不再 COPY 到镜像（首次请求时自动从 hf-mirror.com 下载）
-# 节省 ~1.1GB，模型下载后缓存在容器层或可挂载 volume 固化
+# 预下载 BGE-Reranker 模型到 /app/bge_reranker_cache（build 阶段一次搞定，运行时不用下载）
+RUN pip install huggingface_hub -i https://mirrors.aliyun.com/pypi/simple/ \
+    --trusted-host mirrors.aliyun.com --no-cache-dir \
+    && mkdir -p /app/bge_reranker_cache/BAAI/bge-reranker-base \
+    && HF_ENDPOINT=https://hf-mirror.com huggingface-cli download BAAI/bge-reranker-base \
+    --local-dir /app/bge_reranker_cache/BAAI/bge-reranker-base \
+    --local-dir-use-symlinks False \
+    && rm -rf /root/.cache/pip /root/.cache/huggingface /tmp/*
 
-# 拷贝应用代码
+# 应用代码
 COPY . .
 
 EXPOSE 8080

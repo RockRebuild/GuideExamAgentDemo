@@ -22,16 +22,12 @@ services:
       - ./chat_logs:/app/chat_logs
       - ./eval_log.jsonl:/app/eval_log.jsonl
       - ./hf_cache:/root/.cache/huggingface
-      - ./bge_reranker_cache:/app/bge_reranker_cache
     depends_on:
       - redis
       - weather-mcp
     restart: always
     networks:
       - guide-net
-    dns:
-      - 114.114.114.114
-      - 8.8.8.8
 
   weather-mcp:
     build:
@@ -41,9 +37,6 @@ services:
       - "8000:8000"
     networks:
       - guide-net
-    dns:
-      - 114.114.114.114
-      - 8.8.8.8
     restart: always
 
 networks:
