@@ -135,7 +135,18 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    reranker_status = "unknown"
+    try:
+        from server.core.retrieval_utils import _reranker_disabled, _is_reranker_permanently_disabled
+        if _is_reranker_permanently_disabled():
+            reranker_status = "permanently_disabled"
+        elif _reranker_disabled:
+            reranker_status = "disabled_this_session"
+        else:
+            reranker_status = "enabled"
+    except Exception:
+        pass
+    return {"status": "ok", "reranker": reranker_status}
 
 
 # Mount static files AFTER route definitions

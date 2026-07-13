@@ -1,26 +1,29 @@
+# ── Python / 开发环境 ──
 venv/
 .venv/
-chroma_db/
-chat_logs/
 __pycache__/
 *.pyc
+.pdm-python
+.mypy_cache/
+.pdm-build/
+
+# ── Git / IDE ──
 .git/
 .gitignore
 .claude/
 .idea/
 .vscode/
-.env
-*.pdf
-*.log
 *.swp
 *.swo
-.pdm-python
+
+# ── 运行时生成的数据（不需要上传到 ECS） ──
+# chat_logs/ 和 eval_log.jsonl 是运行中产生的日志，上传无意义
+chat_logs/
 eval_log.jsonl
-bge_reranker_cache/
+
+# ── 文档 ──
 README.md
-Dockerfile*
-docker-compose*
-.dockerignore
-download_reranker_model.py
-hf_cache/
-download_reranker_model.py
+
+# ── 大文件 ──
+*.pdf
+*.log
