@@ -35,6 +35,19 @@ async def submit_feedback(request: Request, body: FeedbackRequest):
     update_last_feedback(body.feedback_type)
     # 确保反馈一定落盘（即使没做过 RAGAS 评估）
     log_feedback(body.question, body.answer, body.feedback_type, body.comment or "")
+
+    # ── 语义缓存：用户点"有用"时写入，点"无用"时删除 ──
+    if body.feedback_type == "positive" and body.contexts:
+        from server.core.semantic_cache import store
+        from server.core.tools import CONTEXT_SEPARATOR
+        result_text = CONTEXT_SEPARATOR.join(body.contexts)
+        store(body.question, result_text)
+    elif body.feedback_type == "negative":
+        from server.core.semantic_cache import remove_by_query
+        removed = remove_by_query(body.question)
+        if removed:
+            print(f"🗑️ 语义缓存: 用户踩了「{body.question[:40]}...」，已从缓存删除", flush=True)
+
     return {"status": "ok"}
 
 

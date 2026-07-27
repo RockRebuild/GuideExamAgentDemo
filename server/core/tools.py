@@ -3,6 +3,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 from difflib import SequenceMatcher
 from typing import Optional, List, Tuple
 
@@ -12,6 +14,17 @@ from langchain_openai import ChatOpenAI
 from rank_bm25 import BM25Okapi
 import jieba
 
+# langfuse observe: 兼容 langfuse 新旧版本两种导入路径
+try:
+    from langfuse._client.observe import observe  # langfuse < 5.x
+except ImportError:
+    try:
+        from langfuse.decorators import observe  # langfuse >= 5.x
+    except ImportError:
+        # 如果都不行，用一个空壳防止 import 失败
+        def observe(**kwargs):
+            return lambda f: f
+
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.tools import tool, StructuredTool
@@ -20,6 +33,16 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 print("=== tools.py 开始执行 ===", file=sys.stderr, flush=True)
+
+# ── Langfuse trace 上下文（用于 tool 内部上报 metadata） ──
+_current_trace_id: Optional[str] = None
+
+def set_trace_id(trace_id: str):
+    global _current_trace_id
+    _current_trace_id = trace_id
+
+def get_trace_id() -> Optional[str]:
+    return _current_trace_id
 
 # ============================================================
 # 全局配置
@@ -48,29 +71,44 @@ def get_embeddings():
 def retrieve_with_rerank(query: str, raw_contexts: List[str]) -> str:
     """
     对原始上下文列表执行精排，并以分隔符拼接为字符串返回。
-    同时将精排后的列表存入 st.session_state，方便 app.py 直接获取。
+    同时将精排后的列表存入 request_contexts，方便上层获取。
+
+    集成语义缓存：如果相同 query 已有缓存结果，直接返回（跳过精排）。
     """
     from server.core.retrieval_utils import refine_and_rerank, determine_top_k
 
     if not raw_contexts:
         return ""
 
-    top_k = determine_top_k(query)
-    refined = refine_and_rerank(raw_contexts, query, top_k=top_k)
+    # ── 语义缓存：封装精排操作，命中缓存则跳过精排 ──
+    from server.core.semantic_cache import lookup_or_compute
 
-    if not refined:
+    def _do_retrieve_and_rerank():
+        top_k = determine_top_k(query)
+        refined = refine_and_rerank(raw_contexts, query, top_k=top_k)
+        if not refined:
+            return ""
+        return CONTEXT_SEPARATOR.join(refined)
+
+    result, is_cache_hit = lookup_or_compute(query, _do_retrieve_and_rerank, auto_store=False)
+
+    if is_cache_hit and result:
+        # 命中缓存：从缓存结果提取 contexts 列表
+        refined = [c.strip() for c in result.split(CONTEXT_SEPARATOR) if c.strip()]
+    elif result:
+        refined = [c.strip() for c in result.split(CONTEXT_SEPARATOR) if c.strip()]
+    else:
         return ""
 
-    # 保存到 contextvar 供 server 端获取（替代 st.session_state）
+    # 保存到 contextvar 供 server 端获取
     try:
         from server.state import request_contexts
         ctx = request_contexts.get()
         request_contexts.set(list(set(ctx + refined)))
     except ImportError:
-        pass  # Streamlit 模式下忽略
+        pass
 
-    # 用分隔符拼接，便于 app.py 拆分
-    return CONTEXT_SEPARATOR.join(refined)
+    return result
 
 
 # ============================================================
@@ -89,23 +127,31 @@ def get_vectorstore(collection_name: str) -> Chroma:
 # ============================================================
 _bm25_index = None
 _bm25_docs = None
+_bm25_init_lock = threading.Lock()
+
 
 def _init_bm25():
-    """用 guide_parent（800字符父切片）构建 BM25 索引，信息量更大，召回更准"""
+    """用 guide_parent（800字符父切片）构建 BM25 索引，信息量更大，召回更准。
+    使用 threading.Lock 保护初始化路径，防止并发请求触发重复构建。
+    """
     global _bm25_index, _bm25_docs
     if _bm25_index is not None:
         return
-    parent_store = get_vectorstore("guide_parent")
-    all_data = parent_store.get()
-    if not all_data['documents']:
-        # 兜底：如果 guide_parent 为空，退回到 guide_child
-        child_store = get_vectorstore(COLLECTION_PARAGRAPH)
-        all_data = child_store.get()
-    if not all_data['documents']:
-        return
-    _bm25_docs = all_data['documents']
-    tokenized_corpus = [list(jieba.cut(doc)) for doc in _bm25_docs]
-    _bm25_index = BM25Okapi(tokenized_corpus)
+    with _bm25_init_lock:
+        # Double-check: 锁内再次检查，防止多个线程同时进入
+        if _bm25_index is not None:
+            return
+        parent_store = get_vectorstore("guide_parent")
+        all_data = parent_store.get()
+        if not all_data['documents']:
+            # 兜底：如果 guide_parent 为空，退回到 guide_child
+            child_store = get_vectorstore(COLLECTION_PARAGRAPH)
+            all_data = child_store.get()
+        if not all_data['documents']:
+            return
+        _bm25_docs = all_data['documents']
+        tokenized_corpus = [list(jieba.cut(doc)) for doc in _bm25_docs]
+        _bm25_index = BM25Okapi(tokenized_corpus)
 
 
 # ============================================================
@@ -171,11 +217,13 @@ def initialize_vectorstores(pdf_path: str = "全国导游人员资格统一考�
 # ============================================================
 
 @tool
+@observe(name="hybrid_search")
 def hybrid_search(query: str, k: int = 12) -> str:
     """
     混合检索教材内容，结合语义搜索和关键词搜索。
     当用户询问任何与教材相关的问题时，优先使用本工具。
     """
+    _t0 = time.time()
     para_store = get_vectorstore(COLLECTION_PARAGRAPH)
     semantic_docs = para_store.similarity_search(query, k=k)
 
@@ -205,6 +253,7 @@ def hybrid_search(query: str, k: int = 12) -> str:
 
 
 @tool
+@observe(name="search_textbook")
 def search_textbook(query: str) -> str:
     """
     从教材中检索相关内容（语义搜索）。
@@ -334,6 +383,7 @@ def rewritten_search(original_query: str, k: int = 12) -> str:
 
 
 @tool
+@observe(name="search_questions")
 def search_questions(chapter: str, qtype: Optional[str] = "全部", count: int = 5) -> str:
     """从题库中按章节和题型检索题目。"""
     try:
@@ -357,6 +407,7 @@ def search_questions(chapter: str, qtype: Optional[str] = "全部", count: int =
 
 
 @tool
+@observe(name="grade_answer")
 def grade_answer(question_id: Optional[str] = None,
                  subject: Optional[str] = None,
                  chapter: Optional[str] = None,
@@ -441,6 +492,7 @@ async def _load_mcp_tools_http_async(url: str) -> List[StructuredTool]:
             def make_sync_call(name=tool_def["name"], desc=tool_def.get("description", ""),
                                input_schema=tool_def.get("inputSchema", {})):
                 def sync_call(**kwargs):
+                    from server.core.executor import run_async_in_sync
                     async def _call():
                         async with httpx.AsyncClient(base_url=url, timeout=10.0) as c:
                             resp = await c.post("/mcp", json={
@@ -452,7 +504,7 @@ async def _load_mcp_tools_http_async(url: str) -> List[StructuredTool]:
                             if content:
                                 return content[0].get("text", str(result))
                             return str(result)
-                    return asyncio.run(_call())
+                    return run_async_in_sync(_call(), timeout=12)
                 return sync_call
 
             # 从 JSON Schema 构建 Pydantic args_schema，让 LLM 能看到参数定义
@@ -472,18 +524,12 @@ async def _load_mcp_tools_http_async(url: str) -> List[StructuredTool]:
 def load_mcp_tools_http(url: str) -> List[StructuredTool]:
     """从 HTTP MCP Server 加载工具列表。
     兼容两种场景：asyncio 事件循环内部（FastAPI）和外部（Streamlit/脚本）。
+
+    修复: 原版本在 async 上下文中创建新 ThreadPoolExecutor + asyncio.run()，
+    存在嵌套风险。现统一使用 run_async_in_sync（自动检测并适配）。
     """
-    import concurrent.futures
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # 不在 asyncio 上下文中 — 直接用 asyncio.run()
-        return asyncio.run(_load_mcp_tools_http_async(url))
-    else:
-        # 在 asyncio 上下文中（如 FastAPI handler）— 用独立线程避免冲突
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(asyncio.run, _load_mcp_tools_http_async(url))
-            return future.result(timeout=15)
+    from server.core.executor import run_async_in_sync
+    return run_async_in_sync(_load_mcp_tools_http_async(url), timeout=15)
 
 
 # ============================================================

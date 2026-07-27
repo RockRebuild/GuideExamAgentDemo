@@ -1,15 +1,36 @@
 import os
 import sys
+import time
+import logging
 
 import redis
 from langchain_openai import ChatOpenAI
 from langfuse._client.observe import observe
+from langfuse import Langfuse
 from langgraph.checkpoint.redis import RedisSaver
 from langgraph.prebuilt import create_react_agent
 from server.core.tools import search_questions, search_textbook, grade_answer, hybrid_search, multi_search, rewritten_search, \
     parent_child_search, load_mcp_tools_http
+from server.core.hitl_tool import confirm_exam
+from langgraph.errors import GraphInterrupt
 from dotenv import load_dotenv
 import asyncio
+
+logger = logging.getLogger(__name__)
+
+# ── Langfuse 深度集成 ──
+_langfuse_client = None
+
+def get_langfuse():
+    """懒加载 Langfuse 客户端（用于手动上报 Score/Metadata）。"""
+    global _langfuse_client
+    if _langfuse_client is None:
+        _langfuse_client = Langfuse(
+            secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+            public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+            host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+        )
+    return _langfuse_client
 
 load_dotenv()  # 自动查找并加载项目根目录下的 .env 文件
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
@@ -37,6 +58,16 @@ def get_memory():
     return _memory
 
 
+def _ensure_checkpointer(name: str = ""):
+    """HITL 中断恢复必须有 checkpointer。Redis 可用用 Redis，不可用用内存。"""
+    ckpt = get_memory()
+    if ckpt is not None:
+        return ckpt
+    from langgraph.checkpoint.memory import MemorySaver
+    print(f"⚠️ Redis 不可用（{name}），使用 MemorySaver 兜底", flush=True)
+    return MemorySaver()
+
+
 # 模型名集中由 DEEPSEEK_MODEL 控制，默认 deepseek-v4-flash（旧 deepseek-chat 2026-07-24 下线）
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
 
@@ -62,7 +93,24 @@ SYSTEM_PROMPT = load_system_prompt()
 _agent_cache = {}
 
 def get_agent_for_mode(mode: str):
-    """根据模式动态创建 Agent，实现工具懒加载（带缓存，天气 MCP 失败时会重试）"""
+    """根据模式动态创建 Agent，实现工具懒加载（带缓存，天气 MCP 失败时会重试）。
+
+    支持 4 种模式：
+    - 📖 教材知识问答：单 Agent + 5 种检索 + 天气
+    - 📝 智能出卷：单 Agent + search_questions + 天气
+    - 📊 阅卷批改：单 Agent + grade_answer + search_textbook + 天气
+    - 🤖 多Agent协作：Multi-Agent Supervisor → Workers 编排（含 HITL 中断）
+    """
+    # 多 Agent 模式：使用 StateGraph Supervisor → Workers 编排
+    if mode == "🤖 多Agent协作":
+        from server.core.multi_agent import build_supervisor_graph
+        builder = build_supervisor_graph()
+        agent = builder.compile(checkpointer=_ensure_checkpointer("多Agent协作"))
+
+        # 缓存 + 标记天气已加载（天气 MCP 由各 Worker 各自处理，这里不需要）
+        _agent_cache[mode] = (agent, True)
+        return agent
+
     # 如果已缓存且天气工具已成功加载，直接返回
     if mode in _agent_cache:
         cached_agent, was_weather_loaded = _agent_cache[mode]
@@ -76,9 +124,10 @@ def get_agent_for_mode(mode: str):
         tools = [search_textbook, hybrid_search, multi_search,
                  rewritten_search, parent_child_search]
     elif mode == "📝 智能出卷":
-        tools = [search_questions]
+        tools = [search_questions, confirm_exam]
+        final_prompt = SYSTEM_PROMPT + "\n\n⚠️ 出卷确认：整理好试卷内容后，必须先调用 confirm_exam 工具进行人在回路确认，确认后才能输出试卷。"
     elif mode == "📊 阅卷批改":
-        tools = [search_textbook, grade_answer]   # ← 确保这里有 grade_answer
+        tools = [search_textbook, grade_answer]
     # 加载天气 MCP Server（依次尝试 Docker 容器名 / localhost / 127.0.0.1）
     weather_loaded = False
     for host in ["weather-mcp", "localhost", "127.0.0.1"]:
@@ -98,7 +147,7 @@ def get_agent_for_mode(mode: str):
         import re
         final_prompt = re.sub(r'- get_weather[^\n]*\n', '', final_prompt)
         final_prompt = re.sub(r'- 查询天气[^\n]*\n', '', final_prompt)
-    agent = create_react_agent(llm, tools, checkpointer=get_memory(), prompt=final_prompt)
+    agent = create_react_agent(llm, tools, checkpointer=_ensure_checkpointer(mode), prompt=final_prompt)
     _agent_cache[mode] = (agent, weather_loaded)
     return agent
 
@@ -108,61 +157,129 @@ from tenacity import (
     retry_if_exception_type, before_sleep_log
 )
 from openai import RateLimitError, APIConnectionError, InternalServerError, APITimeoutError
-import logging
-
-logger = logging.getLogger(__name__)
 
 RETRYABLE = (RateLimitError, APIConnectionError, InternalServerError, APITimeoutError)
+# 上下文超限 400 — 不重试但自动裁剪后重试
+# 注意: 只用英文关键词匹配，避免中文泛化词（"超过" "过长"）误伤
+CONTEXT_OVERFLOW_KEYWORDS = [
+    "context length", "too long", "maximum context",
+    "context_length_exceeded", "maximum token", "token limit",
+    "reduce the length", "exceeds the maximum",
+]
 
 @observe()
 def stream_agent_with_retry(agent, messages, config=None):
     """带重试的流式调用生成器。
 
-    如果检测到 checkpoint 中有孤儿 tool_calls（上次请求中断），
+    检测到 checkpoint 中有孤儿 tool_calls（上次请求中断），
     自动切换到新 thread_id 重试，避免 LangGraph 状态校验失败。
+
+    兼容：ReAct Agent 和 Multi-Agent Supervisor Graph 均使用 .stream()。
     """
-    import time
     import copy
     last_error = None
-    orphan_fixed = False  # 只允许一次孤儿修复，防止死循环
+    orphan_fixed = False
     attempt = 0
 
     while attempt < 3:
         try:
-            for chunk in agent.stream({"messages": messages}, config=config):
-                yield chunk
-            return  # 成功
+            # Command(resume=...) 必须直接传给 stream，不能包在 {"messages": ...} 里。
+            # 包进去的话 StateGraph 会当成新请求从头跑，不会从断点恢复。
+            from langgraph.types import Command
+            if isinstance(messages, Command):
+                for chunk in agent.stream(messages, config=config):
+                    yield chunk
+            else:
+                for chunk in agent.stream({"messages": messages}, config=config):
+                    yield chunk
+            return
         except RETRYABLE as e:
             last_error = e
             attempt += 1
             logger.warning(f"Agent stream 失败 (attempt {attempt}/3): {e}")
             if attempt < 3:
                 time.sleep(min(2 ** attempt, 10))
+        except GraphInterrupt:
+            # HITL 中断：正常的 graph 暂停，不重试，不报错
+            return
         except Exception as e:
             err_msg = str(e)
-            # 孤儿 tool_calls：LangGraph checkpoint 中有未完成的工具调用
             if "tool_calls" in err_msg and "ToolMessage" in err_msg:
                 if orphan_fixed:
-                    raise  # 修复一次后仍失败，不再重试
+                    raise
                 orphan_fixed = True
-                logger.warning(
-                    f"检测到孤儿 tool_calls，切换新会话重试: {err_msg[:200]}"
-                )
-                # 创建新 thread_id 绕过损坏的 checkpoint
+                logger.warning(f"检测到孤儿 tool_calls，切换新会话重试: {err_msg[:200]}")
                 old_tid = config.get("configurable", {}).get("thread_id", "default")
                 new_tid = f"{old_tid}_{int(time.time())}"
                 config = copy.deepcopy(config) if config else {}
                 config.setdefault("configurable", {})["thread_id"] = new_tid
-                # 补上 SystemPrompt（孤儿状态下的新会话需要完整上下文）
                 from langchain_core.messages import SystemMessage
                 if isinstance(messages, list) and not any(
                     isinstance(m, SystemMessage) for m in messages
                 ):
                     messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
-                # 孤儿修复不消耗重试次数
                 logger.info(f"已切换到新 thread_id: {new_tid}")
                 continue
+
+            # ── 上下文超限检测：裁剪后自动重试 ──
+            is_context_overflow = any(
+                kw in err_msg.lower() for kw in CONTEXT_OVERFLOW_KEYWORDS
+            )
+            if is_context_overflow and attempt < 2:
+                attempt += 1
+                logger.warning(
+                    f"⚠️ 上下文超限 (attempt {attempt}/3): 尝试裁剪后重试..."
+                )
+                try:
+                    from server.core.context_manager import trim_checkpoint_state
+                    metadata = trim_checkpoint_state(agent, config)
+                    logger.info(
+                        "上下文裁剪: %d → %d tokens",
+                        metadata.get("original_tokens", 0),
+                        metadata.get("estimated_tokens", 0),
+                    )
+                except Exception as trim_err:
+                    logger.warning("上下文裁剪失败: %s", trim_err)
+                time.sleep(1)
+                continue
+
             raise
 
 
+# ── Langfuse Score 上报 ──
 
+def report_ragas_to_langfuse(trace_id: str, scores: dict):
+    """将 RAGAS 评估分数上报到 Langfuse Trace。"""
+    try:
+        lf = get_langfuse()
+        for metric, value in scores.items():
+            if value is not None:
+                lf.score(
+                    trace_id=trace_id,
+                    name=f"ragas_{metric}",
+                    value=float(value),
+                    comment=f"RAGAS {metric} 自动评估",
+                )
+    except Exception as e:
+        logger.warning(f"Langfuse 分数上报失败: {e}")
+
+
+def report_tool_call_to_langfuse(trace_id: str, tool_name: str, latency_ms: float,
+                                  recall_count: int = 0, reranked_count: int = 0):
+    """将单次工具调用的 metadata 上报到 Langfuse。"""
+    try:
+        lf = get_langfuse()
+        metadata = {
+            "tool": tool_name,
+            "latency_ms": round(latency_ms, 1),
+            "recall_count": recall_count,
+            "reranked_count": reranked_count,
+        }
+        lf.score(
+            trace_id=trace_id,
+            name=f"tool_{tool_name}",
+            value=1.0 if recall_count > 0 else 0.5,
+            comment=f"recall={recall_count}, reranked={reranked_count}, latency={latency_ms:.0f}ms",
+        )
+    except Exception:
+        pass

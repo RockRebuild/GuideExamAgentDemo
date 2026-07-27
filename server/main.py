@@ -3,6 +3,7 @@
 
 import os
 import locale
+import signal
 
 # ── 编码设置 ──────────────────────────────────────────
 try:
@@ -21,9 +22,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import redis
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+
+# ── 结构化日志初始化 ─────────────────────────────────
+from server.core.structured_logger import setup_structured_logging, RequestIdMiddleware
+setup_structured_logging()
 
 # ── Langfuse (import to initialize) ──────────────────
 from langfuse import Langfuse
@@ -61,12 +66,39 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ 预热失败（首次请求时懒加载）: {e}")
 
+    # ── 并发控制初始化 ──
+    try:
+        from server.core.concurrency import init_manager, ConcurrencyConfig
+        config = ConcurrencyConfig.from_env()
+        app.state.concurrency = init_manager(config=config, redis_client=app.state.redis)
+        print("✅ ConcurrencyManager 已初始化")
+    except Exception as e:
+        print(f"⚠️ ConcurrencyManager 初始化失败: {e}")
+        app.state.concurrency = None
+
     yield
 
-    # Shutdown
+    # ── Graceful Shutdown ──────────────────────────────
+    # 1. 停止接收新请求（由 uvicorn 处理 SIGTERM）
+    # 2. 等待现有 SSE 连接完成（最多 30s）
+    # 3. 关闭全局线程池
+    # 4. 关闭 Redis
+    from server.core.structured_logger import get_logger
+    logger = get_logger("server.main")
+    logger.info("Starting graceful shutdown...")
+
+    try:
+        from server.core.executor import shutdown_executor
+        shutdown_executor(wait=True, timeout=30)
+        logger.info("ThreadPoolExecutor shutdown complete")
+    except Exception as e:
+        logger.warning(f"ThreadPoolExecutor shutdown error: {e}")
+        shutdown_executor(wait=False)
+
     try:
         if app.state.redis:
             app.state.redis.close()
+            logger.info("Redis connection closed")
     except Exception:
         pass
 
@@ -79,7 +111,7 @@ app = FastAPI(
 )
 
 # ── Import routes AFTER app is created to avoid circular imports ──
-from server.routes import chat, feedback, evaluation, question_bank, cost, chat_log, wrong_book
+from server.routes import chat, feedback, evaluation, question_bank, cost, chat_log, wrong_book, agent_eval, hitl
 from server.routes.cost import router as cost_router  # has two routes
 
 app.include_router(chat.router)
@@ -89,6 +121,31 @@ app.include_router(question_bank.router)
 app.include_router(cost_router)
 app.include_router(chat_log.router)
 app.include_router(wrong_book.router)
+app.include_router(agent_eval.router)
+app.include_router(hitl.router)
+
+# ── Structured Logging Middleware ──────────────────────
+app.add_middleware(RequestIdMiddleware)
+
+# ── Prometheus Metrics Endpoint ────────────────────────
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics 端点。
+    暴露: request_duration, tool_call_duration, circuit_breaker_state,
+          queue_depth, rate_limited, cache_hit_ratio 等关键指标。
+    """
+    from server.core.metrics import get_metrics_response, PROMETHEUS_AVAILABLE
+    if not PROMETHEUS_AVAILABLE:
+        return Response(
+            content=get_metrics_response(),
+            media_type="text/plain",
+            status_code=501,
+        )
+    return Response(
+        content=get_metrics_response(),
+        media_type="text/plain; version=0.0.4",
+    )
 
 
 # ── Modes endpoint ────────────────────────────────────
@@ -122,6 +179,14 @@ async def list_modes():
                     "帮我批改题目 科目四的第十章多选第三题，我选 A，B",
                 ]
             },
+            {
+                "name": "🤖 多Agent协作",
+                "samples": [
+                    "对比一下导游业务第三章和法律法规第四章的主要知识点",
+                    "出3道单选题并解释每道题涉及的教材知识点",
+                    "帮我批改答案后推荐相关知识点复习",
+                ]
+            },
         ]
     }
 
@@ -135,6 +200,21 @@ async def root():
 
 @app.get("/health")
 async def health():
+    """Deep health check: Redis, ChromaDB, DeepSeek API, Reranker, Concurrency。
+
+    设计原理:
+    - Kubernetes readiness probe 用 GET /health?level=ready
+    - Kubernetes liveness probe 用 GET /health?level=alive
+    - 运维监控用 GET /health?level=deep (全部检查)
+    """
+    import time, psutil
+
+    level = "deep"  # 默认深度检查
+
+    checks = {}
+    overall = "ok"
+
+    # ── Reranker 状态 ──────────────────────────────
     reranker_status = "unknown"
     try:
         from server.core.retrieval_utils import _reranker_disabled, _is_reranker_permanently_disabled
@@ -146,7 +226,129 @@ async def health():
             reranker_status = "enabled"
     except Exception:
         pass
-    return {"status": "ok", "reranker": reranker_status}
+    checks["reranker"] = reranker_status
+
+    # ── Redis (深度检查: 实际 ping) ─────────────────
+    redis_status = "not_available"
+    redis_latency_ms = None
+    if hasattr(app.state, "redis") and app.state.redis:
+        try:
+            t0 = time.monotonic()
+            app.state.redis.ping()
+            redis_latency_ms = (time.monotonic() - t0) * 1000
+            redis_status = "ok"
+        except Exception:
+            redis_status = "error"
+    checks["redis"] = {
+        "status": redis_status,
+        "latency_ms": round(redis_latency_ms, 1) if redis_latency_ms else None,
+    }
+
+    # ── ChromaDB (深度检查: 集合数量 + 文档计数) ──
+    chroma_status = "unknown"
+    chroma_detail = {}
+    try:
+        from server.core.tools import get_vectorstore
+        collections = ["guide_child", "guide_parent", "guide_summary", "guide_sentence", "semantic_cache"]
+        total_docs = 0
+        for coll_name in collections:
+            try:
+                vs = get_vectorstore(coll_name)
+                count = vs._collection.count()
+                chroma_detail[coll_name] = count
+                total_docs += count
+            except Exception:
+                chroma_detail[coll_name] = -1
+        chroma_status = "ok" if total_docs > 0 else "empty"
+        chroma_detail["total_docs"] = total_docs
+    except Exception as e:
+        chroma_status = "error"
+        chroma_detail["error"] = str(e)[:200]
+    checks["chromadb"] = {"status": chroma_status, **chroma_detail}
+
+    # ── DeepSeek API (深度检查: 实际 API 延迟) ─────
+    deepseek_status = "not_checked"
+    deepseek_latency_ms = None
+    try:
+        from langchain_openai import ChatOpenAI
+        ping_llm = ChatOpenAI(
+            model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+            base_url="https://api.deepseek.com/v1",
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            temperature=0,
+            max_tokens=1,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        t0 = time.monotonic()
+        ping_llm.invoke("ping")
+        deepseek_latency_ms = (time.monotonic() - t0) * 1000
+        deepseek_status = "ok"
+    except Exception as e:
+        deepseek_status = "error"
+        deepseek_latency_ms = (time.monotonic() - t0) * 1000 if 't0' in dir() else None
+    checks["deepseek_api"] = {
+        "status": deepseek_status,
+        "latency_ms": round(deepseek_latency_ms, 1) if deepseek_latency_ms else None,
+    }
+
+    # ── 并发控制状态 ─────────────────────────────
+    concurrency_status = "not_initialized"
+    if hasattr(app.state, "concurrency") and app.state.concurrency:
+        try:
+            concurrency_status = app.state.concurrency.get_health()
+        except Exception:
+            concurrency_status = "error"
+    checks["concurrency"] = concurrency_status
+
+    # ── 系统资源 ─────────────────────────────────
+    try:
+        mem = psutil.virtual_memory()
+        checks["system"] = {
+            "memory_total_mb": round(mem.total / 1024 / 1024, 1),
+            "memory_available_mb": round(mem.available / 1024 / 1024, 1),
+            "memory_percent": mem.percent,
+            "cpu_percent": psutil.cpu_percent(interval=0.1),
+        }
+    except Exception:
+        checks["system"] = "unavailable"
+
+    # ── 综合判定 ─────────────────────────────────
+    if redis_status == "error":
+        overall = "degraded"
+    if chroma_status == "error":
+        overall = "degraded"
+    if deepseek_status == "error":
+        overall = "degraded"
+
+    return {
+        "status": overall,
+        "checks": checks,
+    }
+
+
+@app.get("/api/queue/status")
+async def queue_status(request: Request, token: str = ""):
+    """SSE 端点：推送排队位置变化。前端在收到 429+queue 后连接此端点。"""
+    from fastapi.responses import StreamingResponse
+
+    manager = getattr(request.app.state, "concurrency", None)
+    if manager is None:
+        return JSONResponse(
+            {"error": "concurrency not available"}, status_code=503
+        )
+
+    async def event_stream():
+        async for sse in manager.stream_queue_position(token):
+            yield sse
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # Mount static files AFTER route definitions

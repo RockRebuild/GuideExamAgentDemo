@@ -1,13 +1,79 @@
 # eval_logger.py
 # 评估日志：以 JSONL 格式记录每次提问的回答与 RAGAS 评估结果
 # 可用于后续构建评估数据集、趋势分析、迭代优化
+#
+# 日志轮转：按日期自动轮转 (eval_log_2026-07-27.jsonl)，
+# 保留最近 N 天的文件，避免文件无限增长。
 
+import glob
 import json
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from typing import Optional
 
-EVAL_LOG_FILE = os.path.join(os.path.dirname(__file__), "eval_log.jsonl")
+EVAL_LOG_DIR = os.path.dirname(__file__)
+EVAL_LOG_FILE = os.path.join(EVAL_LOG_DIR, "eval_log.jsonl")
+
+# 轮转配置
+LOG_MAX_AGE_DAYS = int(os.environ.get("EVAL_LOG_MAX_AGE_DAYS", "30"))
+LOG_ROTATION_ENABLED = os.environ.get("EVAL_LOG_ROTATION_ENABLED", "true").lower() == "true"
+
+
+def _get_dated_log_path(date_str: str = None) -> str:
+    """获取按日期的日志文件路径。"""
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    return os.path.join(EVAL_LOG_DIR, f"eval_log_{date_str}.jsonl")
+
+
+def _rotate_if_needed():
+    """如果 eval_log.jsonl 跨天了，将昨天的内容移动到日期命名的文件中。"""
+    if not LOG_ROTATION_ENABLED:
+        return
+
+    if not os.path.exists(EVAL_LOG_FILE):
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    dated_path = _get_dated_log_path()
+
+    # 检查文件是否已有今天的数据
+    file_mtime = os.path.getmtime(EVAL_LOG_FILE)
+    file_date = datetime.fromtimestamp(file_mtime).strftime("%Y-%m-%d")
+
+    if file_date < today:
+        # 文件是昨天或更早的 → 重命名
+        target = _get_dated_log_path(file_date)
+        # 如果目标文件已存在，追加而非覆盖
+        if os.path.exists(target):
+            with open(EVAL_LOG_FILE, "r", encoding="utf-8") as src:
+                with open(target, "a", encoding="utf-8") as dst:
+                    dst.write(src.read())
+            os.remove(EVAL_LOG_FILE)
+        else:
+            os.rename(EVAL_LOG_FILE, target)
+
+    # 清理过期文件
+    _cleanup_old_logs()
+
+
+def _cleanup_old_logs():
+    """删除超过 LOG_MAX_AGE_DAYS 天的日志文件。"""
+    cutoff = datetime.now() - timedelta(days=LOG_MAX_AGE_DAYS)
+    pattern = os.path.join(EVAL_LOG_DIR, "eval_log_*.jsonl")
+
+    for filepath in glob.glob(pattern):
+        basename = os.path.basename(filepath)
+        match = re.search(r'(\d{4}-\d{2}-\d{2})', basename)
+        if match:
+            try:
+                file_date = datetime.strptime(match.group(1), "%Y-%m-%d")
+                if file_date < cutoff:
+                    os.remove(filepath)
+                    print(f"🗑️ 已删除过期评估日志: {basename}", flush=True)
+            except ValueError:
+                pass
 
 
 def _serialize_score(val) -> Optional[float]:
@@ -38,6 +104,8 @@ def log_evaluation(question: str, answer: str, contexts: list[str],
     feedback : str | None
         用户反馈（"positive" / "negative"），评估时可能尚未反馈
     """
+    _rotate_if_needed()  # 写入前检查是否需要轮转
+
     record = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "question": question,

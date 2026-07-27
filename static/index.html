@@ -295,6 +295,21 @@ details .inner { padding-left: 0.3rem; }
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
 .streaming-tools-indicator { margin-top: 0.5rem; font-size: 0.78rem; color: var(--blue); }
 
+/* Queue & rate-limit indicators */
+.queue-banner {
+  display: flex; align-items: center; gap: 0.6rem;
+  padding: 0.7rem 1rem; margin: 0.5rem 0;
+  border-radius: 0.5rem; border: 1px solid var(--orange);
+  background: var(--orange-bg); color: var(--orange);
+  font-size: 0.85rem; font-weight: 500;
+  animation: fadeIn 0.3s ease-out;
+}
+.queue-banner .spinner { margin-right: 0.2rem; }
+.cache-notice {
+  display: inline-flex; align-items: center; gap: 0.3rem;
+  font-size: 0.72rem; color: var(--green); margin-left: 0.4rem;
+}
+
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 1000; backdrop-filter: blur(2px); }
 .modal-content {
   background: var(--bg-card); border: 1px solid var(--border);
@@ -800,6 +815,7 @@ details .inner { padding-left: 0.3rem; }
       </details>
     </div>
     <div v-else class="sidebar-subtitle">加载中...</div>
+
     <button class="sidebar-close" @click="sidebarOpen = false" aria-label="关闭菜单">&times;</button>
   </aside>
   <div class="sidebar-overlay" v-if="sidebarOpen" @click="sidebarOpen = false"></div>
@@ -936,10 +952,16 @@ details .inner { padding-left: 0.3rem; }
                 </div>
                 <div class="ragas-note">ℹ️ 评估基于前 5 条上下文（已精排）</div>
               </div>
+
             </template>
           </div>
         </div>
 
+        <!-- Queue & rate-limit indicator -->
+        <div v-if="queueStatus && queueStatus.status !== 'ready'" class="queue-banner">
+          <span class="spinner"></span>
+          排队中 — 前方 {{ queueStatus.position }} 人，预计等待 {{ queueStatus.estimated_wait_s }} 秒
+        </div>
         <!-- Streaming message -->
         <div v-if="streaming" class="chat-msg assistant">
           <div class="bubble">
@@ -972,6 +994,19 @@ details .inner { padding-left: 0.3rem; }
     <div v-else-if="evalError">
       <div style="color:var(--red);">❌ 评估失败：{{ evalError }}</div>
       <button @click="showEvalModal=false">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- HITL Confirm Modal -->
+<div v-if="hitlPending" class="modal-overlay">
+  <div class="modal-content" style="max-width:600px;text-align:left;">
+    <h3 style="margin-bottom:0.8rem;">🛑 Agent 出卷预览（需确认）</h3>
+    <div style="max-height:350px;overflow-y:auto;background:var(--bg-code);padding:0.8rem;border-radius:0.4rem;margin-bottom:1rem;font-size:0.85rem;line-height:1.65;white-space:pre-wrap;" v-html="renderMarkdown(hitlData?.content || '')"></div>
+    <div style="display:flex;gap:0.5rem;justify-content:flex-end;">
+      <button @click="hitlCancel" style="padding:0.4rem 1rem;border-radius:0.4rem;border:1px solid var(--border-light);background:transparent;color:var(--text-dim);cursor:pointer;font-family:inherit;">❌ 取消</button>
+      <button @click="hitlModify" style="padding:0.4rem 1rem;border-radius:0.4rem;border:1px solid var(--border-light);background:transparent;color:var(--text-dim);cursor:pointer;font-family:inherit;">✏️ 修改</button>
+      <button @click="hitlConfirm" style="padding:0.4rem 1rem;border-radius:0.4rem;border:none;background:var(--accent);color:#fff;cursor:pointer;font-weight:600;font-family:inherit;">✅ 确认出卷</button>
     </div>
   </div>
 </div>
@@ -1041,13 +1076,14 @@ function nextMsgId() { return 'msg_' + (++_msgIdCounter) + '_' + Date.now(); }
 const app = createApp({
   setup() {
     // ── Mode ──
-    const modes = ['📖 教材知识问答','📝 智能出卷','📊 阅卷批改'];
+    const modes = ['📖 教材知识问答','📝 智能出卷','📊 阅卷批改','🤖 多Agent协作'];
     const currentMode = ref(modes[0]);
 
     const samples = {
       '📖 教材知识问答': ['政策与法律法规的第二章主要讲了什么？','查询未来五天的杭州天气','《旅游法》第35条是什么？','导游证的种类有哪些？'],
       '📝 智能出卷': ['导游业务 团队导游服务规范 出3道单选题','合同法律制度出5道多选题','中国饮食文化 出4道判断题'],
       '📊 阅卷批改': ['请批改题目 科目一的第一章单选第一题，我的答案是 B','帮我批改题目 科目四的第十章多选第三题，我选 A，B'],
+      '🤖 多Agent协作': ['对比导游业务第三章和法律法规第四章的核心内容','出3道单选题并解释每道题的教材知识点','帮我批改答案后推荐相关知识点复习'],
     };
     const currentSamples = computed(() => samples[currentMode.value] || []);
 
@@ -1060,10 +1096,22 @@ const app = createApp({
 
     // ── Chat ──
     const currentPrompt = ref('');
+    const lastPrompt = ref('');  // HITL 确认时用
     const streaming = ref(false);
     const streamingAnswer = ref('');
     const streamingTools = ref([]);
     const chatScroll = ref(null);
+
+    // ── 并发控制：排队 & 防抖 ──
+    const queueStatus = ref(null);        // { position, estimated_wait_s, status }
+    const pendingRequest = ref(null);     // 防抖：上次请求 { prompt, ts }
+    let _debounceTimer = null;
+
+    // ── Human-in-the-Loop ──
+    const hitlPending = ref(false);
+    const hitlData = ref(null);
+    const hitlThreadId = ref('');
+    const hitlMode = ref('');
 
     // ── Feedback ──
     const feedbackStats = ref({ total: 0, positive_rate: 0 });
@@ -1127,10 +1175,21 @@ const app = createApp({
       scrollToBottom();
     }
 
-    // ── Send message ──
+    // ── Send message (with debounce + rate-limit handling) ──
     async function sendMessage() {
-      const prompt = currentPrompt.value.trim();
+      lastPrompt.value = currentPrompt.value.trim();
+      const prompt = lastPrompt.value;
       if (!prompt || streaming.value) return;
+
+      // ── 防抖：300ms 内相同问题不重复发送 ──
+      const now = Date.now();
+      if (pendingRequest.value && pendingRequest.value.prompt === prompt &&
+          now - pendingRequest.value.ts < 300) {
+        console.log('[Concurrency] 防抖拦截：重复请求被跳过');
+        return;
+      }
+      pendingRequest.value = { prompt, ts: now };
+
       currentPrompt.value = '';
       const mode = currentMode.value;
 
@@ -1138,6 +1197,9 @@ const app = createApp({
       const userMsg = { _id: nextMsgId(), role:'user', content:prompt };
       messagesByMode[mode].push(userMsg);
       scrollToBottom();
+
+      // Reset queue state
+      queueStatus.value = null;
 
       // Start streaming
       streaming.value = true;
@@ -1149,6 +1211,47 @@ const app = createApp({
           method:'POST', headers:{'Content-Type':'application/json'},
           body: JSON.stringify({ prompt, mode })
         });
+
+        // ── 429 处理：限流/排队 ──
+        if (res.status === 429) {
+          const body = await res.json();
+          const retryAfter = parseInt(res.headers.get('Retry-After') || body.retry_after || '5');
+
+          if (body.error === 'queued') {
+            // 进入排队 → 展示排队状态
+            queueStatus.value = {
+              position: body.queue_position || 1,
+              estimated_wait_s: body.estimated_wait_s || retryAfter,
+              token: body.queue_token || '',
+            };
+            streamingAnswer.value = `⏳ 请求已进入排队队列，前方 ${queueStatus.value.position} 人，预计等待 ${queueStatus.value.estimated_wait_s} 秒...\n\n系统将在轮到你时自动推送结果。`;
+            streaming.value = false;
+            return;
+          }
+
+          if (body.error === 'cache_hit' && body.cached_result) {
+            // 缓存命中 → 直接展示缓存结果
+            streamingAnswer.value = body.cached_result + '\n\n⚡ 来自缓存';
+            const msg = {
+              _id: nextMsgId(), role:'assistant',
+              content: streamingAnswer.value,
+              toolRecords:[], toolsOpen:false, feedbackState:null,
+              hasContexts:false, ragasScores:null, comment:'',
+              _contexts:[], _question:prompt, _answer:streamingAnswer.value, _mode:mode,
+            };
+            messagesByMode[mode].push(msg);
+            streaming.value = false;
+            streamingAnswer.value = '';
+            return;
+          }
+
+          // 纯限流 → 展示重试提示
+          streamingAnswer.value = `⏳ ${body.message || '请求频率过高'}（${retryAfter} 秒后可重试）`;
+          streaming.value = false;
+          return;
+        }
+
+        // ── 正常 SSE 流 ──
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', answer = '', toolRecords = [], contexts = [];
@@ -1177,15 +1280,54 @@ const app = createApp({
             } else if (evt==='tool') {
               toolRecords.push(dat);
               streamingTools.value = toolRecords;
+            } else if (evt==='queue') {
+              // 排队状态更新
+              queueStatus.value = {
+                position: dat.position || 0,
+                estimated_wait_s: dat.estimated_wait_s || 0,
+                status: dat.status || 'waiting',
+              };
+              if (dat.status === 'ready') {
+                queueStatus.value = null;
+              }
+            } else if (evt==='hitl') {
+              // LangGraph interrupt() 触发：暂停流，弹确认窗
+              streaming.value = false;
+              hitlData.value = dat;
+              hitlPending.value = true;
+              hitlThreadId.value = dat.thread_id || '';
+              hitlMode.value = dat.mode || currentMode.value;
+              // 保留当前已流式的内容，等用户确认后 resume
+              streamingAnswer.value = answer;
+              streamingTools.value = toolRecords;
+              return;  // 提前返回，不创建消息
             } else if (evt==='done') {
               answer = dat.answer||answer;
               toolRecords = dat.tool_records||toolRecords;
               contexts = dat.contexts||[];
+
+              // ── HITL：search_questions 被调用过 → 出卷完成，弹确认窗 ──
+              const calledSearchQuestions = toolRecords.some(r => r.name === 'search_questions');
+              if (calledSearchQuestions &&
+                  (mode === '🤖 多Agent协作' || mode === '📝 智能出卷')) {
+                streaming.value = false;
+                streamingAnswer.value = answer;
+                streamingTools.value = toolRecords;
+                hitlData.value = { type: 'exam_ready', content: answer };
+                hitlPending.value = true;
+                return;
+              }
             } else if (evt==='error') {
               answer = '❌ 错误：'+(dat.message||'未知错误');
               streamingAnswer.value = answer;
             }
           }
+        }
+
+        // ── HITL 暂停则不创建消息，等用户确认/取消 ──
+        if (hitlPending.value) {
+          scrollToBottom();
+          return;
         }
 
         const msg = {
@@ -1197,8 +1339,6 @@ const app = createApp({
           _contexts: contexts, _question: prompt, _answer: answer, _mode: mode,
         };
         messagesByMode[mode].push(msg);
-
-        // Save to chat_logs/
         saveChatLog(msg);
       } catch(e) {
         messagesByMode[mode].push({
@@ -1244,6 +1384,7 @@ const app = createApp({
           body: JSON.stringify({
             question: msg._question||'', answer: msg._answer||msg.content,
             feedback_type: type, comment: msg.comment||'',
+            contexts: msg._contexts || [],
           })
         });
         msg.feedbackState = (type==='negative'||msg.feedbackState==='pending_comment') ? 'done' : 'positive';
@@ -1310,6 +1451,7 @@ const app = createApp({
       try { Object.assign(cost, await api('/api/cost/daily')); costLoaded.value=true; } catch(e){}
       refreshWrongCount();
       loadQb();
+      loadCacheStats();
     });
 
     // ── Wrong Book ──
@@ -1347,9 +1489,151 @@ const app = createApp({
       } catch(e) { /* silent */ }
     }
 
+    // ── Human-in-the-Loop handlers ──
+    // LangGraph interrupt() 模式：POST /api/hitl/resume → 消费恢复后的 SSE 流
+    async function resumeAndMerge(action, modifications) {
+      const threadId = hitlThreadId.value;
+      const mode = hitlMode.value;
+      // 保存之前流式输出的内容（如 Supervisor 路由、search_questions 工具调用等）
+      const prevAnswer = streamingAnswer.value || '';
+      const prevTools = [...(streamingTools.value || [])];
+
+      streaming.value = true;
+      streamingAnswer.value = prevAnswer;
+      streamingTools.value = prevTools;
+
+      try {
+        const res = await fetch('/api/hitl/resume', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ thread_id: threadId, mode, action, modifications: modifications || undefined }),
+        });
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '', answer = prevAnswer, toolRecords = [...prevTools], contexts = [];
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const parts = buf.split('\n\n');
+          buf = parts.pop();
+          for (const part of parts) {
+            if (!part.trim()) continue;
+            const lines = part.split('\n');
+            let evt = '', dat = '';
+            for (const l of lines) {
+              if (l.startsWith('event: ')) evt = l.substring(7);
+              else if (l.startsWith('data: ')) dat = l.substring(6);
+            }
+            if (!dat) continue;
+            try { dat = JSON.parse(dat); } catch (e) { continue; }
+
+            if (evt === 'agent') {
+              answer += dat.content || '';
+              streamingAnswer.value = answer;
+              scrollToBottom();
+            } else if (evt === 'tool') {
+              toolRecords.push(dat);
+              streamingTools.value = toolRecords;
+            } else if (evt === 'done') {
+              answer = dat.answer || answer;
+              toolRecords = dat.tool_records || toolRecords;
+              contexts = dat.contexts || [];
+            } else if (evt === 'hitl') {
+              // 修改后可能再次触发 interrupt（重新出卷）
+              hitlData.value = dat;
+              hitlThreadId.value = dat.thread_id || '';
+              hitlMode.value = dat.mode || mode;
+              streaming.value = false;
+              return;  // 再次等待用户操作
+            } else if (evt === 'error') {
+              answer += '\n\n❌ 错误：' + (dat.message || '');
+              streamingAnswer.value = answer;
+            }
+          }
+        }
+
+        streaming.value = false;
+        streamingAnswer.value = '';
+        streamingTools.value = [];
+        hitlPending.value = false;
+        hitlData.value = null;
+
+        const msg = {
+          _id: nextMsgId(), role: 'assistant',
+          content: answer || '(无回答)',
+          toolRecords, toolsOpen: toolRecords.length > 0,
+          feedbackState: null, hasContexts: contexts.length > 0,
+          ragasScores: null, comment: '',
+          _contexts: contexts, _question: lastPrompt.value || '',
+          _answer: answer, _mode: mode,
+        };
+        messagesByMode[mode].push(msg);
+        saveChatLog(msg);
+        scrollToBottom();
+      } catch (e) {
+        streaming.value = false;
+        streamingAnswer.value = '';
+        streamingTools.value = [];
+        hitlPending.value = false;
+        messagesByMode[mode].push({
+          _id: nextMsgId(), role: 'assistant',
+          content: '❌ 恢复失败：' + e.message,
+          toolRecords: [], toolsOpen: false, feedbackState: null,
+          hasContexts: false, ragasScores: null, comment: '',
+        });
+        scrollToBottom();
+      }
+    }
+
+    async function hitlConfirm() {
+      if (hitlThreadId.value) {
+        resumeAndMerge('confirm');  // LangGraph interrupt: 调后端恢复
+      } else {
+        // Fallback: 客户端检测模式（LLM 未调用 confirm_exam）
+        const mode = currentMode.value;
+        const content = streamingAnswer.value || hitlData.value?.content || '(无回答)';
+        const tools = streamingTools.value || [];
+        const msg = { _id: nextMsgId(), role: 'assistant', content, toolRecords: tools, toolsOpen: tools.length > 0, feedbackState: null, hasContexts: false, ragasScores: null, comment: '', _contexts: [], _question: lastPrompt.value || '', _answer: content, _mode: mode };
+        messagesByMode[mode].push(msg);
+        streaming.value = false; streamingAnswer.value = ''; streamingTools.value = [];
+        hitlPending.value = false; hitlData.value = null;
+        saveChatLog(msg); scrollToBottom();
+      }
+    }
+    async function hitlModify() {
+      if (hitlThreadId.value) {
+        const newCount = prompt('请输入新的题目数量：');
+        resumeAndMerge('modify', newCount ? { new_count: parseInt(newCount) } : {});
+      } else {
+        // Fallback: 客户端检测 — 预填修改指令
+        const newCount = prompt('请输入新的题目数量：');
+        hitlPending.value = false; hitlData.value = null;
+        streaming.value = false; streamingAnswer.value = ''; streamingTools.value = [];
+        if (newCount) { currentPrompt.value = `修改题目数量为${newCount}道，重新出卷`; }
+      }
+    }
+    async function hitlCancel() {
+      if (hitlThreadId.value) {
+        resumeAndMerge('cancel');  // LangGraph interrupt: 通知 agent 取消
+      } else {
+        // Fallback: 客户端检测 — 直接丢弃
+        streaming.value = false; streamingAnswer.value = ''; streamingTools.value = [];
+        hitlPending.value = false; hitlData.value = null;
+      }
+    }
+
+    // ── Cache stats ──
+    const cacheStats = ref({hits:0, misses:0, hit_rate:0});
+    async function loadCacheStats() {
+      try { Object.assign(cacheStats.value, await api('/api/agent-eval/cache-stats')); } catch(e){}
+    }
+
     return {
       modes, currentMode, currentSamples, switchMode, sidebarOpen,
       messagesByMode, currentMessages, currentPrompt, streaming, streamingAnswer, streamingTools, chatScroll,
+      queueStatus, pendingRequest,
       sendMessage, sendSample,
       feedbackStats, submitFeedback,
       showEvalModal, evalRunning, evalError, evalCount, startEval,
@@ -1358,6 +1642,10 @@ const app = createApp({
       renderMarkdown, escapeHtml, scoreColor, metricLabel,
       showWrongBook, wrongList, wrongCount, wrongFilter, wrongSubjects, wrongLoading,
       loadWrongBook, removeWrong, clearWrongBook, refreshWrongCount,
+      // HITL
+      hitlPending, hitlData, hitlThreadId, hitlMode,
+      hitlConfirm, hitlModify, hitlCancel,
+      cacheStats, loadCacheStats,
     };
   }
 });

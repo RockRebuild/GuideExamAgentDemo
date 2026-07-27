@@ -95,9 +95,13 @@ def evaluate_current_answer(question: str, answer: str, contexts: list[str]) -> 
         for i, (name, fn) in enumerate(metrics):
             futures[name] = pool.submit(fn)
             if i < len(metrics) - 1:
-                time.sleep(3)
+                time.sleep(1)  # 减少交错延迟，从 3s → 1s
         for name, future in futures.items():
-            scores[name] = future.result()
+            try:
+                scores[name] = future.result(timeout=45)  # 每个指标最多等 45s
+            except Exception as e:
+                print(f"🔥 RAGAS {name} 超时或失败: {e}", flush=True)
+                scores[name] = None
 
     return scores
 

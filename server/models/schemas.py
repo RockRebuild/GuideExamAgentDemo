@@ -29,6 +29,7 @@ class FeedbackRequest(BaseModel):
     answer: str
     feedback_type: str = Field(..., pattern="^(positive|negative)$")
     comment: Optional[str] = ""
+    contexts: Optional[List[str]] = []
 
 
 class FeedbackStatsResponse(BaseModel):
