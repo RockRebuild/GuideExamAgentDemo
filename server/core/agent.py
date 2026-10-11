@@ -16,8 +16,6 @@ from langgraph.errors import GraphInterrupt
 from dotenv import load_dotenv
 import asyncio
 
-logger = logging.getLogger(__name__)
-
 # ── Langfuse 深度集成 ──
 _langfuse_client = None
 
@@ -68,18 +66,19 @@ def _ensure_checkpointer(name: str = ""):
     return MemorySaver()
 
 
-# 模型名集中由 DEEPSEEK_MODEL 控制，默认 deepseek-v4-flash（旧 deepseek-chat 2026-07-24 下线）
+# ── LLM 供应商（支持故障转移）──────────────────────────
+from server.core.llm_provider import get_provider, get_primary_llm, get_fallback_llm, get_active_llm, failover_to_fallback, reset_to_primary
+from server.core.llm_provider import FAILOVER_ENABLED, PRIMARY_PROVIDER, FALLBACK_PROVIDER
+
+def _create_default_llm():
+    """创建默认 LLM 实例（使用当前活跃供应商）。"""
+    return get_active_llm(temperature=0, streaming=True)
+
+# 模型名集中由 DEEPSEEK_MODEL 控制，默认 deepseek-v4-flash
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
 
-llm = ChatOpenAI(
-    model=DEEPSEEK_MODEL,
-    base_url="https://api.deepseek.com/v1",  # 必须加 /v1
-    api_key=os.environ.get("DEEPSEEK_API_KEY"),
-    temperature=0,
-    streaming=True,
-    # 显式关闭思考模式，等价于旧 deepseek-chat 的非思考行为
-    extra_body={"thinking": {"type": "disabled"}},
-)
+# 模块级默认 LLM（仅用于启动预热，实际使用 get_agent_for_mode 中动态创建的实例）
+llm = _create_default_llm()
 
 def load_system_prompt(filepath="prompts/system_prompt.md"):
     """从 Markdown 文件加载 System Prompt"""
@@ -87,12 +86,15 @@ def load_system_prompt(filepath="prompts/system_prompt.md"):
         return f.read()
 SYSTEM_PROMPT = load_system_prompt()
 
-# 2. 告诉 Agent 它能用什么工具
 # Agent 缓存：key=mode，value=(agent, weather_loaded)
-# 如果天气 MCP 首次加载失败，下次请求会重试，直到成功后再缓存
+# 注意: failover 切换供应商后需要清缓存，让 agent 用新 LLM 重建
 _agent_cache = {}
 
-def get_agent_for_mode(mode: str):
+def clear_agent_cache():
+    """清空 Agent 缓存（failover 切换后调用，强制用新 LLM 重建）"""
+    _agent_cache.clear()
+
+def get_agent_for_mode(mode: str, llm_override=None):
     """根据模式动态创建 Agent，实现工具懒加载（带缓存，天气 MCP 失败时会重试）。
 
     支持 4 种模式：
@@ -100,7 +102,13 @@ def get_agent_for_mode(mode: str):
     - 📝 智能出卷：单 Agent + search_questions + 天气
     - 📊 阅卷批改：单 Agent + grade_answer + search_textbook + 天气
     - 🤖 多Agent协作：Multi-Agent Supervisor → Workers 编排（含 HITL 中断）
+
+    Args:
+        mode: 聊天模式
+        llm_override: 可选 LLM 实例。failover 时传入备选 LLM 重建 Agent。
     """
+    # 使用传入的 LLM 或默认创建
+    _llm = llm_override or get_active_llm(temperature=0, streaming=True)
     # 多 Agent 模式：使用 StateGraph Supervisor → Workers 编排
     if mode == "🤖 多Agent协作":
         from server.core.multi_agent import build_supervisor_graph
@@ -147,7 +155,7 @@ def get_agent_for_mode(mode: str):
         import re
         final_prompt = re.sub(r'- get_weather[^\n]*\n', '', final_prompt)
         final_prompt = re.sub(r'- 查询天气[^\n]*\n', '', final_prompt)
-    agent = create_react_agent(llm, tools, checkpointer=_ensure_checkpointer(mode), prompt=final_prompt)
+    agent = create_react_agent(_llm, tools, checkpointer=_ensure_checkpointer(mode), prompt=final_prompt)
     _agent_cache[mode] = (agent, weather_loaded)
     return agent
 
@@ -168,11 +176,13 @@ CONTEXT_OVERFLOW_KEYWORDS = [
 ]
 
 @observe()
-def stream_agent_with_retry(agent, messages, config=None):
-    """带重试的流式调用生成器。
+def stream_agent_with_retry(agent, messages, config=None, mode: str = ""):
+    """带重试 + 供应商故障转移的流式调用生成器。
 
     检测到 checkpoint 中有孤儿 tool_calls（上次请求中断），
     自动切换到新 thread_id 重试，避免 LangGraph 状态校验失败。
+
+    DeepSeek 重试耗尽后自动切换到 Kimi K3 故障转移。
 
     兼容：ReAct Agent 和 Multi-Agent Supervisor Graph 均使用 .stream()。
     """
@@ -183,8 +193,6 @@ def stream_agent_with_retry(agent, messages, config=None):
 
     while attempt < 3:
         try:
-            # Command(resume=...) 必须直接传给 stream，不能包在 {"messages": ...} 里。
-            # 包进去的话 StateGraph 会当成新请求从头跑，不会从断点恢复。
             from langgraph.types import Command
             if isinstance(messages, Command):
                 for chunk in agent.stream(messages, config=config):
@@ -200,7 +208,6 @@ def stream_agent_with_retry(agent, messages, config=None):
             if attempt < 3:
                 time.sleep(min(2 ** attempt, 10))
         except GraphInterrupt:
-            # HITL 中断：正常的 graph 暂停，不重试，不报错
             return
         except Exception as e:
             err_msg = str(e)
@@ -244,6 +251,34 @@ def stream_agent_with_retry(agent, messages, config=None):
                 continue
 
             raise
+
+    # ── 重试耗尽 → 供应商故障转移 ──
+    # 仅从主供应商转移（防止 Kimi 也失败时无限递归 failover）
+    current_provider = get_provider() if FAILOVER_ENABLED else PRIMARY_PROVIDER
+    if FAILOVER_ENABLED and mode and current_provider == PRIMARY_PROVIDER:
+        logger.warning(
+            "🔁 %s 重试耗尽，尝试切换到 %s...",
+            PRIMARY_PROVIDER, FALLBACK_PROVIDER,
+        )
+        try:
+            if failover_to_fallback():
+                clear_agent_cache()
+                fallback_llm = get_fallback_llm(temperature=0, streaming=True)
+                fallback_agent = get_agent_for_mode(mode, llm_override=fallback_llm)
+                logger.warning("✅ 已切换到 %s，用新 Agent 重试", FALLBACK_PROVIDER)
+                yield from stream_agent_with_retry(
+                    fallback_agent, messages, config, mode=mode,
+                )
+                return
+            else:
+                logger.error("备选供应商 %s 不可用（未配置 API Key）", FALLBACK_PROVIDER)
+        except Exception as fe:
+            logger.error("故障转移失败: %s", fe)
+
+    raise last_error or RuntimeError(
+        f"Agent stream 失败：已达最大重试次数"
+        f" (主={PRIMARY_PROVIDER}, 备={'已启用' if FAILOVER_ENABLED else '未启用'})"
+    )
 
 
 # ── Langfuse Score 上报 ──

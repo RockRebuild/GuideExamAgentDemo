@@ -70,14 +70,8 @@ SUPERVISOR_SYSTEM_PROMPT = _load_supervisor_prompt()
 
 
 def classify_intent(prompt: str) -> dict:
-    from langchain_openai import ChatOpenAI
-    llm = ChatOpenAI(
-        model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
-        base_url="https://api.deepseek.com/v1",
-        api_key=os.environ.get("DEEPSEEK_API_KEY"),
-        temperature=0,
-        extra_body={"thinking": {"type": "disabled"}},
-    )
+    from server.core.llm_provider import get_active_llm
+    llm = get_active_llm(temperature=0, streaming=False)
     try:
         resp = llm.invoke(f"{SUPERVISOR_SYSTEM_PROMPT}\n\n用户请求：{prompt}\n\n请输出JSON路由决策：")
         text = resp.content.strip()
@@ -135,13 +129,29 @@ def supervisor_node(state: MultiAgentState, config=None) -> dict:
 
 def retrieval_worker_node(state: MultiAgentState, config=None) -> dict:
     from server.core.agent import get_agent_for_mode
-    agent = get_agent_for_mode("📖 教材知识问答")
     user_input = _get_user_input(state)
-    result = agent.invoke(
-        {"messages": [HumanMessage(content=user_input)]},
-        config={"configurable": {"thread_id": f"r_{id(state)}"}},
-    )
-    return {"messages": result.get("messages", [])}
+    try:
+        agent = get_agent_for_mode("📖 教材知识问答")
+        result = agent.invoke(
+            {"messages": [HumanMessage(content=user_input)]},
+            config={"configurable": {"thread_id": f"r_{id(state)}"}},
+        )
+        msgs = result.get("messages", [])
+        # Debug: log message types
+        msg_types = []
+        for m in msgs:
+            t = getattr(m, 'type', None) or getattr(m, 'role', 'unknown')
+            c = getattr(m, 'content', '') or ''
+            msg_types.append(f"{t}(len={len(str(c))})")
+        logger.info("retrieval_worker: input=%s, msgs=%d, types=%s",
+                     user_input[:80], len(msgs), msg_types)
+        print(f"🔥 [DEBUG] retrieval_worker msgs: {msg_types}", flush=True)
+        return {"messages": msgs}
+    except Exception as e:
+        logger.error("retrieval_worker failed: %s", e, exc_info=True)
+        import traceback
+        traceback.print_exc()
+        return {"messages": [AIMessage(content=f"检索时出错：{str(e)[:200]}，请稍后重试。")]}
 
 
 def exam_worker_node(state: MultiAgentState, config=None) -> dict:
@@ -151,6 +161,15 @@ def exam_worker_node(state: MultiAgentState, config=None) -> dict:
 
     # 用一次 LLM 调用提取章节名（不做 tool calling，纯提取）
     chapter, qtype, count = _extract_exam_params(user_input)
+
+    # 没有章节信息 → 直接提示用户，不调 LLM 编造
+    if not chapter:
+        return {"messages": [AIMessage(
+            content="请指定出卷范围，例如：\n"
+                    "• \"导游业务 第三章 出3道单选题\"\n"
+                    "• \"政策与法律法规 合同法律制度 出5道多选题\"\n"
+                    "• \"全国导游基础知识 中国历史文化 出4道判断题\""
+        )]}
 
     # 调 search_questions
     sq_result = search_questions.invoke({"chapter": chapter, "qtype": qtype, "count": count})
@@ -180,10 +199,58 @@ def exam_worker_node(state: MultiAgentState, config=None) -> dict:
 
 
 def _extract_exam_params(user_input: str) -> tuple:
-    """从用户输入提取出卷参数：章节、题型、数量。正则 + LLM 兜底。"""
-    # 正则提取：教材名 + 章节 + 题型 + 数量（覆盖 90% 的情况）
-    qtype_map = {"单选": "单选题", "多选": "多选题", "判断": "判断题"}
-    qtype = "全部"
+    """用 LLM 从用户输入中提取出卷参数：章节、题型、数量。
+
+    正则解析"导游业务 第三章"、"政策法规 合同法律制度 出5道多选题" 这类输入，
+    质量很差。改用 LLM 做结构化提取，准确性高很多。
+    """
+    from server.core.llm_provider import get_active_llm
+    prompt = (
+        "从用户输入中提取出卷参数，返回 JSON：\n"
+        '用户输入："""' + user_input + '"""\n\n'
+        "字段说明：\n"
+        "- chapter: 用户指定的章节或学科范围。如果用户没有指定（如只说\"出3道题\"），返回空字符串 \"\"\n"
+        "- qtype: 题型。必须是\"单选\",\"多选\",\"判断\"之一。没指定则返回\"单选\"\n"
+        "- count: 题目数量。没指定则返回 3，最大 10\n\n"
+        "只返回 JSON，不要其他文字。示例输出：\n"
+        '{"chapter":"政策与法律法规 第八章","qtype":"多选","count":5}\n'
+        '{"chapter":"导游业务 第三章","qtype":"单选","count":3}\n'
+        '{"chapter":"中国饮食文化","qtype":"判断","count":4}\n'
+        '{"chapter":"","qtype":"单选","count":3}\n'
+    )
+    try:
+        llm = get_active_llm(temperature=0, streaming=False)
+        if hasattr(llm, 'max_tokens'):
+            llm.max_tokens = 80
+        resp = llm.invoke(prompt)
+        text = resp.content.strip()
+        # Extract JSON from possible markdown wrapping
+        import re as _re
+        m = _re.search(r'\{[^}]+\}', text)
+        if m:
+            data = json.loads(m.group(0))
+        else:
+            data = json.loads(text)
+
+        chapter = data.get("chapter", "")
+        qtype = data.get("qtype", "单选")
+        # Normalize qtype
+        qtype_map = {"单选题": "单选", "多选题": "多选", "判断题": "判断",
+                      "single": "单选", "multiple": "多选", "judge": "判断"}
+        qtype = qtype_map.get(qtype, qtype)
+        if qtype not in ("单选", "多选", "判断"):
+            qtype = "单选"
+        count = max(1, min(10, int(data.get("count", 3))))
+        return (chapter or "", qtype, count)
+    except Exception as e:
+        logger.warning("LLM exam param extraction failed: %s, falling back to regex", e)
+        return _extract_exam_params_regex(user_input)
+
+
+def _extract_exam_params_regex(user_input: str) -> tuple:
+    """正则兜底提取出卷参数（LLM 失败时使用）。"""
+    qtype_map = {"单选": "单选", "多选": "多选", "判断": "判断"}
+    qtype = "单选"
     for kw, mapped in qtype_map.items():
         if kw in user_input:
             qtype = mapped
@@ -193,56 +260,69 @@ def _extract_exam_params(user_input: str) -> tuple:
     m = _re.search(r'(\d+)\s*道', user_input)
     if m:
         count = max(1, min(10, int(m.group(1))))
-    # 章节：尝试提取"第X章"或"教材名 第X章"模式
-    chapter = user_input  # 兜底整句
+    chapter = user_input
     ch_match = _re.search(r'(第[一二三四五六七八九十\d]+章)', user_input)
     if ch_match:
-        # 看看前面有没有教材名
         prefix = user_input[:ch_match.start()].strip()
         if prefix:
-            # 去掉末尾的"出" "抽"等动词
             prefix = _re.sub(r'(出|抽|要|请|帮我|给我)\s*$', '', prefix).strip()
-            chapter = prefix + " " + ch_match.group(1) if prefix else ch_match.group(1)
+            chapter = (prefix + " " + ch_match.group(1)) if prefix else ch_match.group(1)
         else:
             chapter = ch_match.group(1)
     else:
-        # 没找到章节号，去掉数量/题型关键词后的部分
         chapter = _re.sub(r'\d+\s*道.*$', '', user_input).strip()
-        chapter = _re.sub(r'(单选|多选|判断|选择).*$', '', chapter).strip()
-        chapter = chapter.rstrip('出抽请给我帮 ').strip()
-
-    # 如果还没提取好，试 LLM
+        chapter = _re.sub(r'(单选题|多选题|判断题|选择题|单选|多选|判断).*$', '', chapter).strip()
+        chapter = chapter.rstrip('出抽请给我帮 ')
     if not chapter or chapter == user_input:
         chapter = _try_llm_extract(user_input)
-    return (chapter, qtype, count)
+    return (chapter or "", qtype, count)
 
 
 def _try_llm_extract(user_input: str) -> str:
-    """LLM 兜底提取章节名。"""
-    from langchain_openai import ChatOpenAI
+    """LLM 兜底提取章节名。
+
+    注意: 仅当输入中有明确的学科/教材线索时才调 LLM。
+    如果输入没有任何章节信息（如"出3道题"），不调 LLM——防止 LLM 幻觉编造章节名。
+    """
+    # 快速检查：输入中是否有任何教材/学科/章节关键词
+    has_subject_clue = bool(re.search(
+        r'(导游|政策|法律|全国|地方|科目|教材|第[一二三四五六七八九十\d]+[章节篇]|知识)',
+        user_input
+    ))
+    if not has_subject_clue:
+        # 用户没有指定章节，返回空字符串让上层处理
+        return ""
+
+    from server.core.llm_provider import get_active_llm
     try:
-        llm = ChatOpenAI(
-            model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
-            base_url="https://api.deepseek.com/v1",
-            api_key=os.environ.get("DEEPSEEK_API_KEY"),
-            temperature=0, max_tokens=30,
-            extra_body={"thinking": {"type": "disabled"}},
+        llm = get_active_llm(temperature=0, streaming=False)
+        # 覆盖 max_tokens 限制（提取章节名只需短输出）
+        if hasattr(llm, 'max_tokens'):
+            llm.max_tokens = 30
+        resp = llm.invoke(
+            f"提取章节名（如'导游业务 第三章'），如果用户没有指定章节，返回'NONE'。只返回章节名或NONE：{user_input}"
         )
-        resp = llm.invoke(f"提取章节名（如'导游业务 第三章'），只返回章节名：{user_input}")
-        return resp.content.strip() or user_input
+        result = resp.content.strip()
+        if not result or result.upper() == "NONE":
+            return ""
+        return result
     except Exception:
-        return user_input
+        return ""
 
 
 def grader_worker_node(state: MultiAgentState, config=None) -> dict:
     from server.core.agent import get_agent_for_mode
-    agent = get_agent_for_mode("📊 阅卷批改")
     user_input = _get_user_input(state)
-    result = agent.invoke(
-        {"messages": [HumanMessage(content=user_input)]},
-        config={"configurable": {"thread_id": f"g_{id(state)}"}},
-    )
-    return {"messages": result.get("messages", [])}
+    try:
+        agent = get_agent_for_mode("📊 阅卷批改")
+        result = agent.invoke(
+            {"messages": [HumanMessage(content=user_input)]},
+            config={"configurable": {"thread_id": f"g_{id(state)}"}},
+        )
+        return {"messages": result.get("messages", [])}
+    except Exception as e:
+        logger.error("grader_worker failed: %s", e, exc_info=True)
+        return {"messages": [AIMessage(content=f"批改时出错：{str(e)[:200]}，请稍后重试。")]}
 
 
 # ═══════════ Graph Build ═══════════

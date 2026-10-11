@@ -24,13 +24,14 @@ RETRYABLE = (RateLimitError, APIConnectionError, InternalServerError, APITimeout
 # 最后更新: 2026-07
 # ============================================================
 
-# DeepSeek 模型定价  https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+# DeepSeek 模型定价
 PRICES = {
-    # Agent 主模型
-    "deepseek-v4-flash":     {"input": 1.0,  "output": 2.0},   # ¥1.0 / 2.0 每百万 token
-    # RAGAS Judge 模型（pro 版精度更高）
-    "deepseek-v4-pro":      {"input": 2.0,  "output": 8.0},   # ¥2.0 / 8.0 每百万 token
+    "deepseek-v4-flash":     {"input": 1.0,  "output": 2.0},
+    "deepseek-v4-pro":      {"input": 2.0,  "output": 8.0},
+    # Kimi K3 定价 (Moonshot API) — 环境变量可覆盖
+    "kimi-k3":              {"input": 4.0,  "output": 8.0},
 }
+# DeepSeek 模型定价  https://api-docs.deepseek.com/zh-cn/quick_start/pricing
 
 # DashScope 嵌入模型定价  https://help.aliyun.com/zh/model-studio
 DASHSCOPE_EMBEDDING_PRICE = 0.0007  # ¥ / 千 token → ¥0.7 / 百万 token

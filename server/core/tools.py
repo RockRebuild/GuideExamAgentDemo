@@ -68,6 +68,17 @@ def get_embeddings():
 # ============================================================
 # 统一检索入口（精排前移）
 # ============================================================
+def _fmt_source(meta: dict) -> str:
+    """Format source annotation from document metadata."""
+    ch = meta.get("chapter", "")
+    pg = meta.get("page", "")
+    if ch:
+        return f"【来源：{ch}，第{pg}页】"
+    if pg:
+        return f"【来源：教材第{pg}页】"
+    return "【来源：教材】"
+
+
 def retrieve_with_rerank(query: str, raw_contexts: List[str]) -> str:
     """
     对原始上下文列表执行精排，并以分隔符拼接为字符串返回。
@@ -176,10 +187,15 @@ def deduplicate_docs(docs: List[Document], threshold: float = 0.8) -> List[Docum
 # 数据初始化（首次运行时创建索引）
 # ============================================================
 def detect_chapter(text: str) -> str:
-    match = re.search(r'第[一二三四五六七八九十\d]+章\s*[^\n]*', text)
+    # 先尝试匹配"第X章"格式
+    match = re.search(r'第[一二三四五六七八九十\d]+章\s*[^\n]{0,30}', text)
     if match:
         return match.group().strip()
-    return "未知章节"
+    # 回退: 搜索"教材""编"等关键词的章节描述
+    match = re.search(r'(?:《[^》]+》|[第第].{0,10}[章节节].{0,20})', text)
+    if match:
+        return match.group().strip()
+    return ""
 
 
 def initialize_vectorstores(pdf_path: str = "全国导游人员资格统一考试模拟试题汇编.pdf"):
@@ -245,9 +261,9 @@ def hybrid_search(query: str, k: int = 12) -> str:
     # 构造带元数据的原始上下文（作为精排的输入）
     raw_contexts = []
     for doc in unique_docs:
-        chapter = doc.metadata.get("chapter", "未知章节")
-        page = doc.metadata.get("page", "未知页")
-        raw_contexts.append(f"【来源：{chapter}，第{page}页】\n{doc.page_content}")
+        chapter = doc.metadata.get("chapter", "")
+        page = doc.metadata.get("page", "")
+        raw_contexts.append(f"{_fmt_source(doc.metadata)}\n{doc.page_content}")
 
     return retrieve_with_rerank(query, raw_contexts)
 
@@ -267,9 +283,7 @@ def search_textbook(query: str) -> str:
 
     raw_contexts = []
     for doc in relevant_docs:
-        chapter = doc.metadata.get("chapter", "未知章节")
-        page = doc.metadata.get("page", "未知页")
-        raw_contexts.append(f"【来源：{chapter}，第{page}页】\n{doc.page_content}")
+        raw_contexts.append(f"{_fmt_source(doc.metadata)}\n{doc.page_content}")
 
     return retrieve_with_rerank(query, raw_contexts)
 
@@ -333,9 +347,7 @@ def parent_child_search(query: str, k: int = 12) -> str:
         raw_contexts = []
         for i, doc_text in enumerate(docs_texts):
             meta = metadatas[i] if i < len(metadatas) else {}
-            chapter = meta.get("chapter", "未知章节")
-            page = meta.get("page", "未知页")
-            raw_contexts.append(f"【来源：{chapter}，第{page}页】\n{doc_text}")
+            raw_contexts.append(f"{_fmt_source(meta)}\n{doc_text}")
 
         return retrieve_with_rerank(query, raw_contexts)
 
@@ -348,13 +360,9 @@ def rewritten_search(original_query: str, k: int = 12) -> str:
     """
     问题改写检索：将用户问题改写为多个变体后并行检索，提高召回率。
     """
-    llm = ChatOpenAI(
-        model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
-        base_url="https://api.deepseek.com/v1",
-        api_key=os.environ.get("DEEPSEEK_API_KEY"),
-        temperature=0.3,  # 非零温度产生多样化的改写变体，提高召回率
-        extra_body={"thinking": {"type": "disabled"}},
-    )
+    from server.core.llm_provider import get_active_llm
+    llm = get_active_llm(temperature=0.3, streaming=False)
+    # 注意: rewrite 需要非零温度产生多样化的改写变体
     rewrite_prompt = f"""将以下用户问题改写成 3 个不同角度的检索查询，每个查询占一行，不要编号和其他文字。
 每个查询应有不同的侧重点，尽可能涵盖问题涉及的不同关键词组合。
 原始问题：{original_query}
@@ -376,9 +384,7 @@ def rewritten_search(original_query: str, k: int = 12) -> str:
 
     raw_contexts = []
     for doc in unique_docs:
-        chapter = doc.metadata.get("chapter", "未知章节")
-        page = doc.metadata.get("page", "未知页")
-        raw_contexts.append(f"【来源：{chapter}，第{page}页】\n{doc.page_content}")
+        raw_contexts.append(f"{_fmt_source(doc.metadata)}\n{doc.page_content}")
     return retrieve_with_rerank(original_query, raw_contexts)
 
 
@@ -392,7 +398,27 @@ def search_questions(chapter: str, qtype: Optional[str] = "全部", count: int =
     except FileNotFoundError:
         return "题库文件未找到，请联系管理员。"
 
-    filter_result = [q for q in questions if chapter in q["chapter"]]
+    # ── 智能匹配：拆分关键词 + search_key 字段 ──
+    # 题库已通过 enrich_question_bank.py 为每条题目添加 search_key 字段，
+    # 包含: 科目编号 + 教材别名 + 章节号 + 章节标题。
+    # 搜索时将用户输入拆分为关键词，每个关键词必须命中 search_key。
+    # 这样 "政策与法律法规 合同法律制度" 和 "导游业务 第三章" 都能正确匹配。
+    keywords = chapter.split()
+    if not keywords:
+        keywords = [chapter]
+
+    def _matches(q: dict) -> bool:
+        """检查题目 search_key 是否包含所有关键词。"""
+        sk = q.get("search_key", "")
+        if not sk:
+            # 兜底：如果 search_key 不存在（旧题库），用 subject+chapter 拼接
+            sk = q.get("subject", "") + " " + q.get("chapter", "")
+        for kw in keywords:
+            if kw not in sk:
+                return False
+        return True
+
+    filter_result = [q for q in questions if _matches(q)]
     if qtype != "全部":
         filter_result = [q for q in filter_result if q["type"] == qtype]
 
@@ -402,8 +428,8 @@ def search_questions(chapter: str, qtype: Optional[str] = "全部", count: int =
 
     result = []
     for q in selected:
-        result.append(f"ID:{q['id']} [{q['type']}] {q['question']}\n选项：{' / '.join(q['options'])}")
-    return "\n\n".join(result) + "\n\n💡 批改时请告诉我题号，例如“科目二 第三章 单选题 第1题”。"
+        result.append(f"ID:{q['id']} [{q['type']}] {q['question']}\n选项: {' / '.join(q['options'])}")
+    return "\n\n".join(result) + "\n\n批改时请告诉我题号，例如: 科目二 第三章 单选题 第1题"
 
 
 @tool

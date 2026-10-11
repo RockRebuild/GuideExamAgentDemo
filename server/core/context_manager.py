@@ -168,16 +168,10 @@ def summarize_messages(messages) -> str:
     conversation_text = _build_conversation_text(messages)
 
     try:
-        from langchain_openai import ChatOpenAI
-
-        summarizer = ChatOpenAI(
-            model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
-            base_url="https://api.deepseek.com/v1",
-            api_key=os.environ.get("DEEPSEEK_API_KEY"),
-            temperature=0,
-            max_tokens=200,
-            extra_body={"thinking": {"type": "disabled"}},
-        )
+        from server.core.llm_provider import get_active_llm
+        summarizer = get_active_llm(temperature=0, streaming=False)
+        if hasattr(summarizer, 'max_tokens'):
+            summarizer.max_tokens = 200
 
         prompt = (
             "将以下对话历史压缩为一段不超过 300 字的简短摘要。"

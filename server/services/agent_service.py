@@ -88,7 +88,8 @@ async def stream_chat(mode: str, prompt: str):
     Each yield is a complete SSE event string (e.g. "data: {...}\n\n").
     """
     # 请求级超时：Agent 单次调用最长执行时间（环境变量可配）
-    REQUEST_TIMEOUT_S = float(os.environ.get("AGENT_REQUEST_TIMEOUT_S", "120"))
+    # 默认 180s：DeepSeek API 慢时 + tool 调用往返可能需要 2 分钟以上
+    REQUEST_TIMEOUT_S = float(os.environ.get("AGENT_REQUEST_TIMEOUT_S", "180"))
     deadline = asyncio.get_event_loop().time() + REQUEST_TIMEOUT_S
 
     thread_id = THREAD_IDS.get(mode, "guide_exam_default")
@@ -148,7 +149,7 @@ async def stream_chat(mode: str, prompt: str):
 
     def _run_sync():
         try:
-            for chunk in stream_agent_with_retry(agent, messages, config):
+            for chunk in stream_agent_with_retry(agent, messages, config, mode=mode):
                 loop.call_soon_threadsafe(queue.put_nowait, ("chunk", chunk))
             loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
         except Exception as e:
@@ -159,46 +160,47 @@ async def stream_chat(mode: str, prompt: str):
     executor = get_executor()
     executor.submit(_run_sync)
 
-    try:
-        while True:
-            # 硬超时保护：防止 Agent 调用永久挂起
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                yield _sse_event("error", {
-                    "message": f"请求超时（{REQUEST_TIMEOUT_S:.0f}s），请简化问题或稍后重试"
+    while True:
+        # 硬超时保护：防止 Agent 调用永久挂起
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            yield _sse_event("timeout", {
+                "message": f"请求处理超时（{REQUEST_TIMEOUT_S:.0f}s），请尝试：1) 简化问题 2) 指定具体章节 3) 稍后重试",
+                "timeout_s": int(REQUEST_TIMEOUT_S),
+            })
+            return
+        try:
+            item = await asyncio.wait_for(queue.get(), timeout=min(remaining, 30))
+        except asyncio.TimeoutError:
+            yield _sse_event("timeout", {
+                "message": f"请求处理超时（{REQUEST_TIMEOUT_S:.0f}s），请尝试：1) 简化问题 2) 指定具体章节 3) 稍后重试",
+                "timeout_s": int(REQUEST_TIMEOUT_S),
+            })
+            return
+        kind = item[0]
+        if kind == "done":
+            break
+        if kind == "error":
+            yield _sse_event("error", {"message": str(item[1])[:300]})
+            return
+
+        chunk = item[1]
+        chunks.append(chunk)
+
+        # ── HITL interrupt 检测：__interrupt__ 出现在 stream 中 ──
+        if "__interrupt__" in chunk:
+            interrupt_data = _extract_interrupt_value(chunk)
+            if interrupt_data:
+                yield _sse_event("hitl", {
+                    "type": "exam_review",
+                    "content": interrupt_data.get("content", ""),
+                    "thread_id": thread_id,
+                    "mode": mode,
                 })
-                return
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=min(remaining, 30))
-            except asyncio.TimeoutError:
-                yield _sse_event("error", {
-                    "message": f"请求超时（{REQUEST_TIMEOUT_S:.0f}s），请简化问题或稍后重试"
-                })
-                return
-            kind = item[0]
-            if kind == "done":
-                break
-            if kind == "error":
-                yield _sse_event("error", {"message": str(item[1])[:300]})
-                return
+                return  # 不 emit done，等用户恢复
 
-            chunk = item[1]
-            chunks.append(chunk)
-
-            # ── HITL interrupt 检测：__interrupt__ 出现在 stream 中 ──
-            if "__interrupt__" in chunk:
-                interrupt_data = _extract_interrupt_value(chunk)
-                if interrupt_data:
-                    yield _sse_event("hitl", {
-                        "type": "exam_review",
-                        "content": interrupt_data.get("content", ""),
-                        "thread_id": thread_id,
-                        "mode": mode,
-                    })
-                    executor.shutdown(wait=False)
-                    return  # 不 emit done，等用户恢复
-
-            # ── 单 Agent 标准 stream 格式 ──
+        # ── 单 Agent 标准 stream 格式 ──
+        if mode != "🤖 多Agent协作":
             if "tools" in chunk:
                 tool_msg = chunk["tools"]["messages"][0]
                 content = tool_msg.content or ""
@@ -223,58 +225,6 @@ async def stream_chat(mode: str, prompt: str):
                 text = chunk["agent"]["messages"][0].content
                 full_answer += text
                 yield _sse_event("agent", {"content": text})
-
-            # ── StateGraph 多 Agent 节点输出 ──
-            # StateGraph 的 chunk key 是节点名（"supervisor"/"retrieval_worker"/...）
-            # Worker 节点内部 agent.invoke() 返回 {"messages": [...]}，
-            # 需要提取其中的 AI 回复和工具调用记录。
-            if mode == "🤖 多Agent协作":
-                for node_name in ("supervisor", "retrieval_worker", "exam_worker", "grader_worker"):
-                    if node_name not in chunk:
-                        continue
-                    node_output = chunk[node_name]
-                    if not isinstance(node_output, dict):
-                        continue
-
-                    # Supervisor 节点：提取路由决策展示给前端
-                    if node_name == "supervisor":
-                        routing = node_output.get("routing", {})
-                        if routing:
-                            workers = routing.get("workers", [])
-                            rmode = routing.get("mode", "single")
-                            mode_emoji = {"single": "➡️", "parallel": "⚡", "sequential": "🔗"}
-                            mode_label = {"single": "路由到", "parallel": "并行分发到", "sequential": "串行调用"}
-                            display = (
-                                f"🔀 Supervisor\n"
-                                f"{mode_emoji.get(rmode, '➡️')} {mode_label.get(rmode, rmode)}: {', '.join(workers)}\n"
-                                f"分析: {routing.get('reasoning', '')}"
-                            )
-                            yield _sse_event("tool", {"name": "🤖 Supervisor", "content": display})
-                            tool_records.append({"name": "🤖 Supervisor", "content": display})
-                        continue
-
-                    # Worker 节点：提取 AI 消息和工具调用
-                    worker_msgs = node_output.get("messages", [])
-                    for msg in worker_msgs:
-                        msg_type = getattr(msg, 'type', None) or getattr(msg, 'role', '')
-                        if msg_type in ('ai', 'assistant'):
-                            text = getattr(msg, 'content', '') or ''
-                            if isinstance(text, str) and text:
-                                full_answer += text
-                                yield _sse_event("agent", {"content": text})
-                        elif msg_type == 'tool':
-                            content = getattr(msg, 'content', '') or ''
-                            display = _normalize_pdf_text(content)
-                            if len(display) > 3000:
-                                display = display[:3000] + "\n\n... (截断)"
-                            name = getattr(msg, 'name', 'unknown')
-                            record = {"name": name, "content": display}
-                            tool_records.append(record)
-                            if name in RETRIEVAL_TOOLS:
-                                tc = extract_contexts_from_response(content or "")
-                                if tc:
-                                    contexts.extend(tc)
-                            yield _sse_event("tool", record)
 
     # ── 收尾前检查：stream 正常结束但 state 中有未处理的 interrupt ──
     # 单 Agent: state.interrupts; 多 Agent/StateGraph: state.tasks
@@ -301,6 +251,38 @@ async def stream_chat(mode: str, prompt: str):
         pass
 
     # ── 多Agent: interrupt 已在 StateGraph 层，__interrupt__ 检测够用 ──
+
+    # ── 多Agent模式：从 state 提取最终回答（StateGraph chunk 格式不稳定，直接读 state）──
+    if mode == "🤖 多Agent协作":
+        try:
+            state = agent.get_state(config)
+            if state and hasattr(state, 'values') and state.values:
+                all_msgs = state.values.get("messages", [])
+                # Debug: dump message types from state
+                stypes = []
+                for m in all_msgs:
+                    mt = m.type if hasattr(m, 'type') else (m.get('type', '') if isinstance(m, dict) else '?')
+                    stypes.append(mt)
+                print(f"[multi-agent] state has {len(all_msgs)} messages: {stypes}", flush=True)
+                for m in all_msgs:
+                    mt = m.type if hasattr(m, 'type') else (m.get('type', '') if isinstance(m, dict) else '')
+                    if mt == 'tool':
+                        name = m.name if hasattr(m, 'name') else (m.get('name', 'unknown') if isinstance(m, dict) else 'unknown')
+                        content = m.content if hasattr(m, 'content') else (m.get('content', '') if isinstance(m, dict) else '')
+                        display = _normalize_pdf_text(str(content))[:3000]
+                        if not any(r.get('name') == name and r.get('content') == display for r in tool_records):
+                            tool_records.append({"name": name, "content": display})
+                            if name in RETRIEVAL_TOOLS:
+                                tc = extract_contexts_from_response(str(content))
+                                if tc:
+                                    contexts.extend(tc)
+                    elif mt == 'ai':
+                        txt = m.content if hasattr(m, 'content') else (m.get('content', '') if isinstance(m, dict) else '')
+                        if isinstance(txt, str) and txt.strip():
+                            full_answer = txt
+                            yield _sse_event("agent", {"content": txt})
+        except Exception as e:
+            print(f"[multi-agent] state extraction failed: {e}", flush=True)
 
     # ── 收尾 ──
     contexts = deduplicate_contexts(contexts)
@@ -374,7 +356,7 @@ async def resume_chat(mode: str, thread_id: str, action: str, modifications: dic
     def _run():
         try:
             for chunk in stream_agent_with_retry(
-                agent, Command(resume=resume_value), config
+                agent, Command(resume=resume_value), config, mode=mode
             ):
                 loop.call_soon_threadsafe(queue.put_nowait, ("chunk", chunk))
             loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
@@ -386,80 +368,102 @@ async def resume_chat(mode: str, thread_id: str, action: str, modifications: dic
     executor = get_executor()
     executor.submit(_run)
 
-    try:
-        while True:
-            item = await queue.get()
-            kind = item[0]
-            if kind == "done":
-                break
-            if kind == "error":
-                yield _sse_event("error", {"message": str(item[1])[:300]})
+    while True:
+        item = await queue.get()
+        kind = item[0]
+        if kind == "done":
+            break
+        if kind == "error":
+            yield _sse_event("error", {"message": str(item[1])[:300]})
+            return
+
+        chunk = item[1]
+        chunks.append(chunk)
+
+        # 恢复流中也可能再次出现 interrupt（如修改后重新出卷）
+        if "__interrupt__" in chunk:
+            interrupt_data = _extract_interrupt_value(chunk)
+            if interrupt_data:
+                yield _sse_event("hitl", {
+                    "type": "exam_review",
+                    "content": interrupt_data.get("content", ""),
+                    "thread_id": thread_id,
+                    "mode": mode,
+                })
                 return
 
-            chunk = item[1]
-            chunks.append(chunk)
+        if "tools" in chunk:
+            tool_msg = chunk["tools"]["messages"][0]
+            content = tool_msg.content or ""
+            display = _normalize_pdf_text(content)
+            if len(display) > 3000:
+                display = display[:3000] + "\n\n... (截断)"
+            record = {"name": tool_msg.name, "content": display}
+            tool_records.append(record)
+            if tool_msg.name in RETRIEVAL_TOOLS:
+                tc = extract_contexts_from_response(tool_msg.content or "")
+                if tc:
+                    contexts.extend(tc)
+            yield _sse_event("tool", record)
 
-            # 恢复流中也可能再次出现 interrupt（如修改后重新出卷）
-            if "__interrupt__" in chunk:
-                interrupt_data = _extract_interrupt_value(chunk)
-                if interrupt_data:
-                    yield _sse_event("hitl", {
-                        "type": "exam_review",
-                        "content": interrupt_data.get("content", ""),
-                        "thread_id": thread_id,
-                        "mode": mode,
-                    })
-                    executor.shutdown(wait=False)
-                    return
+        if "agent" in chunk:
+            text = chunk["agent"]["messages"][0].content
+            full_answer += text
+            yield _sse_event("agent", {"content": text})
 
-            if "tools" in chunk:
-                tool_msg = chunk["tools"]["messages"][0]
-                content = tool_msg.content or ""
-                display = _normalize_pdf_text(content)
-                if len(display) > 3000:
-                    display = display[:3000] + "\n\n... (截断)"
-                record = {"name": tool_msg.name, "content": display}
-                tool_records.append(record)
-                if tool_msg.name in RETRIEVAL_TOOLS:
-                    tc = extract_contexts_from_response(tool_msg.content or "")
-                    if tc:
-                        contexts.extend(tc)
-                yield _sse_event("tool", record)
-
-            if "agent" in chunk:
-                text = chunk["agent"]["messages"][0].content
-                full_answer += text
-                yield _sse_event("agent", {"content": text})
-
-            # ── StateGraph 多Agent节点输出（resume 路径）──
-            if mode == "🤖 多Agent协作":
-                for node_name in ("exam_worker", "retrieval_worker", "grader_worker"):
-                    if node_name not in chunk:
-                        continue
-                    node_output = chunk[node_name]
-                    if not isinstance(node_output, dict):
-                        continue
-                    worker_msgs = node_output.get("messages", [])
-                    for msg in worker_msgs:
+        # ── StateGraph 多Agent节点输出（resume 路径）──
+        if mode == "🤖 多Agent协作":
+            for node_name in ("exam_worker", "retrieval_worker", "grader_worker"):
+                if node_name not in chunk:
+                    continue
+                node_output = chunk[node_name]
+                if not isinstance(node_output, dict):
+                    continue
+                worker_msgs = node_output.get("messages", [])
+                for msg in worker_msgs:
+                    if isinstance(msg, dict):
+                        msg_type = msg.get('type', '') or msg.get('role', '')
+                        text = msg.get('content', '') or ''
+                    elif isinstance(msg, (tuple, list)) and len(msg) >= 2:
+                        msg_type = str(msg[0])
+                        text = str(msg[1])
+                    else:
                         msg_type = getattr(msg, 'type', None) or getattr(msg, 'role', '')
-                        if msg_type in ('ai', 'assistant'):
-                            text = getattr(msg, 'content', '') or ''
-                            if isinstance(text, str) and text:
-                                full_answer += text
-                                yield _sse_event("agent", {"content": text})
-                        elif msg_type == 'tool':
-                            content = getattr(msg, 'content', '') or ''
-                            display = _normalize_pdf_text(content)
-                            if len(display) > 3000:
-                                display = display[:3000] + "\n\n... (截断)"
-                            name = getattr(msg, 'name', 'unknown')
-                            record = {"name": name, "content": display}
-                            tool_records.append(record)
-                            if name in RETRIEVAL_TOOLS:
-                                tc = extract_contexts_from_response(content or "")
-                                if tc:
-                                    contexts.extend(tc)
-                            yield _sse_event("tool", record)
+                        text = getattr(msg, 'content', '') or ''
+
+                    if msg_type in ('ai', 'assistant'):
+                        if isinstance(text, str) and text.strip():
+                            full_answer += text
+                            yield _sse_event("agent", {"content": text})
+                    elif msg_type == 'tool':
+                        content = str(text) if text else ''
+                        display = _normalize_pdf_text(content)
+                        if len(display) > 3000:
+                            display = display[:3000] + "\n\n... (截断)"
+                        name = getattr(msg, 'name', None) if not isinstance(msg, (dict, tuple, list)) else (msg.get('name', 'unknown') if isinstance(msg, dict) else 'unknown')
+                        record = {"name": name or 'unknown', "content": display}
+                        tool_records.append(record)
+                        if name in RETRIEVAL_TOOLS:
+                            tc = extract_contexts_from_response(content or "")
+                            if tc:
+                                contexts.extend(tc)
+                        yield _sse_event("tool", record)
+
+    # ── 兜底：stream 没提取到回答时从 state 恢复（同 stream_chat）──
+    if not full_answer.strip():
+        try:
+            state = agent.get_state(config)
+            if state and hasattr(state, 'values') and state.values:
+                state_msgs = state.values.get("messages", [])
+                for m in reversed(state_msgs):
+                    mt = m.type if hasattr(m, 'type') else (m.get('type', '') if isinstance(m, dict) else None)
+                    if mt == 'ai':
+                        txt = m.content if hasattr(m, 'content') else (m.get('content', '') if isinstance(m, dict) else '')
+                        if isinstance(txt, str) and txt.strip():
+                            full_answer = txt
+                            break
+        except Exception as e:
+            print(f"[multi-agent] resume state recovery failed: {e}", flush=True)
 
     contexts = deduplicate_contexts(contexts)
 

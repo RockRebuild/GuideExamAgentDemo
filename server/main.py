@@ -3,7 +3,6 @@
 
 import os
 import locale
-import signal
 
 # ── 编码设置 ──────────────────────────────────────────
 try:
@@ -207,8 +206,7 @@ async def health():
     - Kubernetes liveness probe 用 GET /health?level=alive
     - 运维监控用 GET /health?level=deep (全部检查)
     """
-    import time, psutil
-
+    import time
     level = "deep"  # 默认深度检查
 
     checks = {}
@@ -269,6 +267,7 @@ async def health():
     # ── DeepSeek API (深度检查: 实际 API 延迟) ─────
     deepseek_status = "not_checked"
     deepseek_latency_ms = None
+    t0 = None
     try:
         from langchain_openai import ChatOpenAI
         ping_llm = ChatOpenAI(
@@ -285,7 +284,8 @@ async def health():
         deepseek_status = "ok"
     except Exception as e:
         deepseek_status = "error"
-        deepseek_latency_ms = (time.monotonic() - t0) * 1000 if 't0' in dir() else None
+        if t0 is not None:
+            deepseek_latency_ms = (time.monotonic() - t0) * 1000
     checks["deepseek_api"] = {
         "status": deepseek_status,
         "latency_ms": round(deepseek_latency_ms, 1) if deepseek_latency_ms else None,
@@ -302,6 +302,7 @@ async def health():
 
     # ── 系统资源 ─────────────────────────────────
     try:
+        import psutil
         mem = psutil.virtual_memory()
         checks["system"] = {
             "memory_total_mb": round(mem.total / 1024 / 1024, 1),
@@ -309,6 +310,8 @@ async def health():
             "memory_percent": mem.percent,
             "cpu_percent": psutil.cpu_percent(interval=0.1),
         }
+    except ImportError:
+        checks["system"] = "psutil_not_installed"
     except Exception:
         checks["system"] = "unavailable"
 

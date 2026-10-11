@@ -17,7 +17,7 @@ def confirm_exam(exam_content: str) -> str:
         exam_content: 完整的试卷文本（题目 + 选项 + 答题格式提示）
 
     Returns:
-        确认结果描述字符串，Agent 据此决定下一步操作。
+        确认结果描述 + 试卷内容原文，确保 LLM 在确认后能直接输出试卷。
     """
     response = interrupt({
         "type": "exam_review",
@@ -30,10 +30,14 @@ def confirm_exam(exam_content: str) -> str:
         action = str(response) if response else "confirm"
 
     if action == "confirm":
-        return "用户已确认出卷内容，请直接输出完整的试卷。"
+        # 把试卷内容原样返回，LLM 看到后直接在最终回答里输出
+        return (
+            f"用户已确认出卷。以下是需要输出的完整试卷内容，请直接输出：\n\n"
+            f"{exam_content}"
+        )
     elif action == "modify":
         mods = response.get("modifications", {}) if isinstance(response, dict) else {}
         return f"用户要求修改：{mods}。请根据修改要求重新生成试卷。"
     elif action == "cancel":
         return "用户取消了出卷请求。请礼貌告知用户已取消。"
-    return "用户已确认，请继续。"
+    return f"用户已确认。请输出以下内容：\n\n{exam_content}"
